@@ -432,11 +432,18 @@ func (f *fakeOpenCode) runPrompt(id, text, command string, pending chan struct{}
 	}
 	session.Messages = append(session.Messages, message, opencode.NativeMessage{ID: opencode.NewMessageID(), Type: "idle", Outcome: outcome})
 	session.Info.Outcome = outcome
+	terminal := map[string]any{}
+	if text == "ERROR" {
+		outcome = "failed"
+		session.Info.Outcome = outcome
+		session.Messages[len(session.Messages)-1].Outcome = outcome
+		terminal["error"] = map[string]any{"type": "rate_limit", "message": "account rate limit", "status": 429}
+	}
 	if text == "FORGET" {
 		delete(f.sessions, id)
 	}
 	f.save()
-	f.publish(id, "session.execution."+outcome, map[string]any{})
+	f.publish(id, "session.execution."+outcome, terminal)
 	f.mu.Unlock()
 }
 

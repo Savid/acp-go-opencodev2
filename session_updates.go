@@ -324,7 +324,7 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, message openc
 
 		native, err := rt.client.Session(readCtx, s.nativeID)
 		if err != nil {
-			return err
+			return s.transportFailure(ctx, rt, err)
 		}
 
 		update.Cost = &acp.Cost{Amount: native.Cost, Currency: "USD"}

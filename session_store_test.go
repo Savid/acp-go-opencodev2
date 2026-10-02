@@ -209,6 +209,8 @@ func TestMirrorCommitRefusesWhatItCannotAttempt(t *testing.T) {
 	require.Equal(t, vendor+"_"+wire.TokenTurnFailed, data[wire.FieldError],
 		"a turn whose native history vanished is not durable")
 	require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
+	require.EqualValues(t, 404, data["statusCode"])
+	require.Equal(t, "opencode HTTP status 404", data[wire.FieldMessage])
 }
 
 func TestRestoreRefusesMissingImageArtifact(t *testing.T) {
@@ -593,4 +595,62 @@ func TestRestoreVerifiesPromotedPendingInput(t *testing.T) {
 	require.Error(t, verifyPendingInputs([]opencode.InboxInput{input}, nil, nil))
 	record := sessionRecord{SessionID: "ses_native", NativeSessionID: "ses_native", Cwd: t.TempDir(), UpdatedAtUnixMilli: 1, PendingInputs: map[string][]opencode.InboxInput{"ses_native": {input, input}}}
 	require.ErrorContains(t, record.validate("ses_native"), "duplicate native pending input")
+}
+
+func TestMirrorFailureFencesTurnAndAllowsRetry(t *testing.T) {
+	t.Parallel()
+
+	for _, prompt := range []string{"HELLO", "ERROR"} {
+		t.Run(prompt, func(t *testing.T) {
+			t.Parallel()
+
+			store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+			h := newHarness(t, WithSessionStore(store))
+			h.initialize(withLifecycle())
+			created := h.newSession()
+			before, err := store.Load(t.Context(), string(created.SessionId))
+			require.NoError(t, err)
+			store.fail.Store(true)
+			t.Cleanup(func() { store.fail.Store(false) })
+			response, err := h.prompt(created.SessionId, prompt, promptMeta(1))
+			require.Empty(t, response.StopReason)
+			require.Equal(t, -32603, requestErrorCode(t, err))
+			data := requestErrorData(t, err)
+			require.Equal(t, "opencode_turn_failed", data["error"])
+			if prompt == "ERROR" {
+				require.Equal(t, "provider", data["cause"])
+				require.Equal(t, "account rate limit", data["message"])
+				require.EqualValues(t, 429, data["statusCode"])
+				require.Equal(t, "rate_limit", data["providerCode"])
+			} else {
+				require.Equal(t, "transport", data["cause"])
+				require.Equal(t, "session mirror commit failed", data["message"])
+			}
+			after, err := store.Load(t.Context(), string(created.SessionId))
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running"}, eventTypes(lifecycleEvents(h.rec.snapshot())))
+
+			store.fail.Store(false)
+			response, err = h.prompt(created.SessionId, "HELLO", promptMeta(2))
+			require.NoError(t, err)
+			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+			require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running", "lifecycle_snapshot", "prompt_accepted", "state_update:running", "state_update:idle"}, eventTypes(lifecycleEvents(h.rec.snapshot())))
+			var streams []string
+			for _, update := range h.rec.snapshot() {
+				envelope, ok := update.Meta[wire.LifecycleKey].(map[string]any)
+				if !ok {
+					continue
+				}
+				event, ok := envelope["event"].(map[string]any)
+				if ok && event["type"] == "lifecycle_snapshot" {
+					id, ok := envelope["streamId"].(string)
+					require.True(t, ok)
+					streams = append(streams, id)
+				}
+			}
+			require.Len(t, streams, 2)
+			require.NotEqual(t, streams[0], streams[1])
+		})
+	}
 }

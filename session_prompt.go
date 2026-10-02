@@ -316,6 +316,10 @@ func (s *session) dispatchFailure(ctx context.Context, rt *binding, err error) e
 // child's exit status and stderr tail where it died, otherwise the
 // transport error.
 func (s *session) transportFailure(ctx context.Context, rt *binding, err error) error {
+	if nativeErr, ok := errors.AsType[*opencode.HTTPError](err); ok {
+		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: nativeErr.Error(), StatusCode: nativeErr.Status})
+	}
+
 	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.server.proc, "opencode process", err, rt.server.stream.Err))
 }
 
@@ -393,7 +397,13 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 			s.fenceStream()
 
 			commitFailed = true
-			verdict.failure = s.mirrorFailure(&t.state, err)
+
+			mirrorErr := s.mirrorFailure(&t.state, err)
+
+			if verdict.failure == nil {
+				verdict.failure = mirrorErr
+			}
+
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
 	}
