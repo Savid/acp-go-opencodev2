@@ -46,6 +46,10 @@ type usageConnection struct {
 }
 
 func (c *Client) usageCatalog(ctx context.Context, directory string) ([]usageProvider, []usageProvider, error) {
+	if err := c.WaitForPlugins(ctx, directory); err != nil {
+		return nil, nil, err
+	}
+
 	var providers, models struct {
 		Data []usageProvider `json:"data"`
 	}

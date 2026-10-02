@@ -123,6 +123,10 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 	s.updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
+	if err := rt.client.WaitForPlugins(ctx, s.cwd); err != nil {
+		return s.startFailure(ctx, err)
+	}
+
 	if err := s.refreshCatalogs(ctx, rt); err != nil {
 		return s.startFailure(ctx, err)
 	}
@@ -131,19 +135,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 		return err
 	}
 
-	for {
-		if err := opencode.CheckPlugin(rt.server.root, s.cwd); err == nil {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return s.startFailure(ctx, ctx.Err())
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-
-	if err := s.refreshCatalogs(ctx, rt); err != nil {
+	if err := opencode.CheckPlugin(rt.server.root, s.cwd); err != nil {
 		return s.startFailure(ctx, err)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/savid/acp-go-core/wire"
@@ -55,8 +56,14 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 			if connection == "null" {
 				connections = "[]"
 			}
+			var ready atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
+				if !ready.Load() && (r.URL.Path == "/api/provider" || r.URL.Path == "/api/model") {
+					_, _ = w.Write([]byte(`{"data":[]}`))
+
+					return
+				}
 				var body string
 				switch r.URL.Path {
 				case "/api/provider":
@@ -64,6 +71,7 @@ func TestUsageAccessVerifiesNativeRoute(t *testing.T) {
 				case "/api/model":
 					body = `{"data":[{"id":"model","providerID":"opencode-go","package":"` + pkg + `","settings":{"baseURL":"` + base + `"` + tc.override + `},"headers":` + headers + `,"variants":` + variants + `}]}`
 				case "/api/integration":
+					ready.Store(true)
 					body = `{"data":[{"id":"opencode-go","connections":` + connections + `}]}`
 				case "/api/credential":
 					body = `{"data":[{"id":"credential","value":{"type":"key","key":"native-key"` + tc.credentialFields + `}}]}`

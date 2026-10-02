@@ -238,3 +238,72 @@ func TestNativeDefaultsAndChangedSelectionSurviveRebind(t *testing.T) {
 	require.Equal(t, "high", native.Model.Variant)
 	require.Equal(t, "build", native.Agent)
 }
+
+func TestSessionCatalogWaitsForPlugins(t *testing.T) {
+	for _, populated := range []bool{true, false} {
+		name := "populated"
+		if !populated {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			a := NewAgent(testOptions(t)...)
+			t.Cleanup(func() { _ = a.Close() })
+			rec := newRecorder()
+			a.attach(rec, nil)
+			_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+			require.NoError(t, err)
+			server, err := a.ensureRuntime(t.Context())
+			require.NoError(t, err)
+			target, err := url.Parse(server.client.URL)
+			require.NoError(t, err)
+			forward := httputil.NewSingleHostReverseProxy(target)
+			var ready atomic.Bool
+			forward.ModifyResponse = func(response *http.Response) error {
+				switch response.Request.URL.Path {
+				case "/api/integration":
+					ready.Store(true)
+				case "/api/model", "/api/agent", "/api/command":
+					if !ready.Load() || (!populated && response.Request.URL.Path == "/api/model") {
+						_ = response.Body.Close()
+						body := `{"data":[]}`
+						response.Body = io.NopCloser(strings.NewReader(body))
+						response.ContentLength = int64(len(body))
+						response.Header.Del("Content-Length")
+					}
+				}
+
+				return nil
+			}
+			proxy := httptest.NewServer(forward)
+			defer proxy.Close()
+			server.client.URL = proxy.URL
+			created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir(), WithSessionOpenCodeOptions(NewOpenCodeOptions(WithOpenCodeEffort("low")))))
+			require.NoError(t, err)
+			mode := configOption(created.ConfigOptions, configMode)
+			require.NotNil(t, mode)
+			require.Equal(t, acp.SessionConfigValueId("build"), mode.CurrentValue)
+			models := configOption(created.ConfigOptions, configModel)
+			require.NotNil(t, models)
+			effort := configOption(created.ConfigOptions, configEffort)
+			require.NotNil(t, effort)
+			window := 0
+			if populated {
+				window = fakeContextWindow
+				require.Len(t, *models.Options.Ungrouped, 2)
+				meta, ok := (*models.Options.Ungrouped)[0].Meta[vendor].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, float64(window), meta["contextWindow"])
+				require.Equal(t, []string{"low", "high"}, meta["supportedEffortLevels"])
+				require.Len(t, *effort.Options.Ungrouped, 2)
+			} else {
+				require.Len(t, *models.Options.Ungrouped, 1)
+				require.Len(t, *effort.Options.Ungrouped, 1)
+			}
+			_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "hello"))
+			require.NoError(t, err)
+			updates := usageUpdates(rec.snapshot())
+			require.Len(t, updates, 1)
+			require.Equal(t, window, updates[0].Size)
+		})
+	}
+}

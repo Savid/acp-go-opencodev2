@@ -164,6 +164,13 @@ func (c *Client) Do(ctx context.Context, directory, method, path string, body, o
 }
 
 func SessionPath(id string) string { return "/api/session/" + url.PathEscape(id) }
+
+// WaitForPlugins uses the integration endpoint's activation barrier before
+// reading catalogs whose endpoints return the current, possibly partial snapshot.
+func (c *Client) WaitForPlugins(ctx context.Context, directory string) error {
+	return c.Do(ctx, directory, http.MethodGet, "/api/integration", nil, nil)
+}
+
 func (c *Client) Session(ctx context.Context, id string) (NativeSession, error) {
 	var out struct {
 		Data NativeSession `json:"data"`
