@@ -1,0 +1,341 @@
+[
+  {
+    "id": "evt_0fa2cd4ea001FGV46SwZ70yAbG",
+    "created": 1790903637226,
+    "type": "session.inbox.enqueued",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "inboxID": "msg_0fa2cd4e9001f46AavFAcHqG4S",
+      "sessionID": "fixture-session",
+      "item": {
+        "type": "user",
+        "payload": {
+          "text": "Reply exactly ACP_NATIVE_OUTSIDE."
+        },
+        "delivery": "steer"
+      }
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 1,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2cd4eb001xUUTRsxp8b4fj1",
+    "created": 1790903637227,
+    "type": "session.execution.started",
+    "data": {
+      "sessionID": "fixture-session"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 2,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2cd4f1001TT0gJU4PM8R4Go",
+    "created": 1790903637233,
+    "metadata": {
+      "instructions": {
+        "initial": true
+      }
+    },
+    "type": "session.instructions.updated",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "delta": {
+        "core/codemode": "3a6c896ca4366410e84edccbf179835337f464e16493a692c18b854a528ce2e1",
+        "core/skill-guidance": "8394362d28c82fa4d13c7a9f5568c05680f6687e07db8f426a0e3c92f3027dc9",
+        "core/date": "152929dbf3b2f78ce2845c96f45e0488a84d629d337990c77aaf906f4643c1e5",
+        "core/environment": "9aa235620309f407829d17e89b9c386afa8dcffff795d3d5fa0fddaed3dd454b"
+      }
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 3,
+      "version": 2
+    }
+  },
+  {
+    "id": "evt_0fa2cd4f20013xiREcePYqi8Tz",
+    "created": 1790903637234,
+    "type": "session.inbox.delivered",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "inboxID": "msg_0fa2cd4e9001f46AavFAcHqG4S"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 4,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2cdc91001HdsuxGMGjVpFan",
+    "created": 1790903639185,
+    "type": "session.usage.updated",
+    "data": {
+      "sessionID": "fixture-session",
+      "cost": 5.61e-05,
+      "tokens": {
+        "input": 521,
+        "output": 8,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    }
+  },
+  {
+    "id": "evt_0fa2cdc92001eNygbB3gCpEm2v",
+    "created": 1790903639186,
+    "type": "session.renamed",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "title": "ACP_NATIVE_OUTSIDE"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 6,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce180001QCUFWIFxh5TQB6",
+    "created": 1790903640448,
+    "type": "session.step.started",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "agent": "build",
+      "model": {
+        "id": "qwen3.8-flash",
+        "providerID": "opencode-go",
+        "variant": "low"
+      },
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "started": 1790903637248
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 7,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce182001IOSXOMqDO427GY",
+    "created": 1790903640450,
+    "type": "session.reasoning.started",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "state": {
+        "signature": ""
+      }
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 8,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce1e8001vlgLwKCjfHmfcC",
+    "created": 1790903640552,
+    "type": "session.reasoning.delta",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "delta": "The user wants me to reply"
+    }
+  },
+  {
+    "id": "evt_0fa2ce2580017xNESoNAQdgk8T",
+    "created": 1790903640664,
+    "type": "session.reasoning.delta",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "delta": " exactly \"ACP_NATIVE_OUTSIDE\"."
+    }
+  },
+  {
+    "id": "evt_0fa2ce258002UbH7rqBqxlneu9",
+    "created": 1790903640664,
+    "type": "session.reasoning.ended",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "text": "The user wants me to reply exactly \"ACP_NATIVE_OUTSIDE\".",
+      "state": {
+        "signature": ""
+      }
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 9,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce259001l45f0UipuUUWRd",
+    "created": 1790903640665,
+    "type": "session.text.started",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 10,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce2be001gOPOjuDPYFl6iH",
+    "created": 1790903640766,
+    "type": "session.text.delta",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "delta": "ACP_NATIVE_OUTSIDE"
+    }
+  },
+  {
+    "id": "evt_0fa2ce2e3001ol2u0r4o6wmFeG",
+    "created": 1790903640803,
+    "type": "session.text.ended",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "ordinal": 0,
+      "text": "ACP_NATIVE_OUTSIDE"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 11,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce2e6001AMpBAMOjEVcQaS",
+    "created": 1790903640806,
+    "type": "session.step.streamed",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 12,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce2e7001ziv0p4ySrkjob2",
+    "created": 1790903640807,
+    "type": "session.step.ended",
+    "location": {
+      "directory": "/workspace"
+    },
+    "data": {
+      "sessionID": "fixture-session",
+      "assistantMessageID": "msg_0fa2cd4fa0010w5jI26d7cPqXP",
+      "finish": "stop",
+      "rawFinish": "end_turn",
+      "cost": 0.0010397,
+      "tokens": {
+        "input": 6,
+        "output": 20,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 5147
+        }
+      }
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 13,
+      "version": 1
+    }
+  },
+  {
+    "id": "evt_0fa2ce2e8001TdYr2yjiWRKoSq",
+    "created": 1790903640808,
+    "type": "session.usage.updated",
+    "data": {
+      "sessionID": "fixture-session",
+      "cost": 0.0010957999999999999,
+      "tokens": {
+        "input": 527,
+        "output": 28,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 5147
+        }
+      }
+    }
+  },
+  {
+    "id": "evt_0fa2ce2e9001G9oL90QvD8GelS",
+    "created": 1790903640809,
+    "type": "session.execution.succeeded",
+    "data": {
+      "sessionID": "fixture-session"
+    },
+    "durable": {
+      "aggregateID": "fixture-session",
+      "seq": 14,
+      "version": 1
+    }
+  }
+]
