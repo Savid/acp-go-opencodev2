@@ -44,6 +44,12 @@ func TestNativePersistence(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(pluginDir, "noop.ts"), []byte(`export default {
  id: "acp-noop-test",
  async setup(ctx) {
+  await new Promise(resolve => setTimeout(resolve, 250))
+  await ctx.model.transform(editor => {
+   for (const model of editor.list()) {
+    editor.update(model.providerID, model.id, draft => { draft.limit.context = 65536 })
+   }
+  })
   await ctx.agent.transform(editor => { editor.update("review", agent => { agent.mode = "primary" }); editor.default("review") })
   await ctx.command.transform(editor => editor.add({name: "acpnoop", description: "Complete without model work", execute: async () => {}}))
  }
@@ -55,12 +61,23 @@ func TestNativePersistence(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SessionId)
 	selectedAgent := ""
+	var models *acp.SessionConfigSelectOptionsUngrouped
 	for _, option := range session.ConfigOptions {
 		if option.Select != nil && option.Select.Id == "mode" {
 			selectedAgent = string(option.Select.CurrentValue)
 		}
+		if option.Select != nil && option.Select.Id == "model" {
+			models = option.Select.Options.Ungrouped
+		}
 	}
 	require.Equal(t, "review", selectedAgent)
+	require.NotNil(t, models)
+	require.NotEmpty(t, *models)
+	for _, model := range *models {
+		meta, ok := model.Meta["opencode"].(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, float64(65536), meta["contextWindow"])
+	}
 	response, err := a.Prompt(t.Context(), wire.TextPromptRequest(session.SessionId, "/acpnoop"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
