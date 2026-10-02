@@ -258,7 +258,7 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 		return nil, wire.InternalFailure(vendor, "")
 	}
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		s.mu.Lock()
 		s.model, s.mode, s.effort = oldModel, oldMode, oldEffort
 		s.mu.Unlock()

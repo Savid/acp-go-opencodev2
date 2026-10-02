@@ -95,6 +95,7 @@ type nativePromptResult struct {
 }
 
 type cycle struct {
+	terminalEvent *opencode.Event
 	lifecycle.Cycle
 	cancelled bool
 	settling  bool
@@ -127,9 +128,7 @@ type turn struct {
 	finished    chan struct{}
 	messageID   string
 	command     bool
-	commandDone bool
-	commandIdle int64
-	seenIdle    int64
+	initialIdle int64
 }
 
 func (t *turn) settle(end turnEnd) {
@@ -244,9 +243,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			if result.err == nil {
 				s.acceptTurn(ctx, t)
 
-				if t.command {
-					t.commandDone = true
-					t.commandIdle = result.idle
+				if t.command && t.initialIdle >= result.idle {
 					s.finishCommand(ctx, t)
 				}
 
@@ -596,7 +593,7 @@ func (s *session) close(ctx context.Context) error {
 
 	if rt != nil {
 		if persisted {
-			if err := s.commitMirror(commitCtx, rt); err != nil {
+			if err := s.commitMirror(commitCtx, rt, nil); err != nil {
 				errs = append(errs, err)
 			}
 		}

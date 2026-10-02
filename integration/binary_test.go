@@ -9,9 +9,11 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -23,6 +25,7 @@ import (
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	opencodeacp "github.com/savid/acp-go-opencodev2"
+	"github.com/savid/acp-go-opencodev2/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -433,4 +436,114 @@ func TestNativePendingPlanInputs(t *testing.T) {
 	require.Contains(t, err.Error(), "backpressure")
 	require.Equal(t, pending, storedPendingInputs(t, store, created.SessionId))
 	require.NoError(t, b.Close())
+}
+
+func TestNativeCompletedCheckpointWithActiveChildAndShell(t *testing.T) {
+	if os.Getenv("ACP_GO_OPENCODEV2_RUN_INTEGRATION") != "1" {
+		t.Skip("set ACP_GO_OPENCODEV2_RUN_INTEGRATION=1")
+	}
+	config, requests, finish := localStreamingModel(t)
+	executable, scratch, endpoint := nativeEndpoint(t)
+	home := t.TempDir()
+	store := acpcore.NewInMemorySessionStore()
+	options := []opencodeacp.Option{executable, scratch, opencodeacp.WithHome(home), opencodeacp.WithSessionStore(store), opencodeacp.WithSeedFiles(map[string]string{"opencode.json": config}), opencodeacp.WithDefaultModel("probe/probe")}
+	a := opencodeacp.NewAgent(options...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	native := endpoint()
+	id := nativeSessionID(t, created.Meta)
+	done := make(chan acp.PromptResponse, 1)
+	failed := make(chan error, 1)
+	go func() {
+		response, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "root"))
+		failed <- promptErr
+		done <- response
+	}()
+	select {
+	case <-requests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("root did not reach provider")
+	}
+	var child struct {
+		Data opencode.NativeSession `json:"data"`
+	}
+	require.NoError(t, native.Do(t.Context(), cwd, http.MethodPost, "/api/session", map[string]any{"parentID": id, "location": opencode.Location{Directory: cwd}, "model": opencode.ModelRef{ProviderID: "probe", ID: "probe"}}, &child))
+	require.NoError(t, native.Do(t.Context(), cwd, http.MethodPost, opencode.SessionPath(child.Data.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "child"}, nil))
+	select {
+	case <-requests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child did not reach provider")
+	}
+	started, release := filepath.Join(t.TempDir(), "started"), filepath.Join(t.TempDir(), "release")
+	shellID := opencode.NewMessageID()
+	shellDone := make(chan error, 1)
+	go func() {
+		shellDone <- native.Do(t.Context(), cwd, http.MethodPost, opencode.SessionPath(id)+"/shell", map[string]any{"id": shellID, "command": "touch " + started + "; while [ ! -f " + release + " ]; do sleep 0.01; done; printf SHELL_DONE"}, nil)
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0600) })
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(started)
+
+		return statErr == nil
+	}, 5*time.Second, 10*time.Millisecond)
+	var transcript struct {
+		Data []opencode.NativeMessage `json:"data"`
+	}
+	require.NoError(t, native.Do(t.Context(), "", http.MethodGet, opencode.SessionPath(id)+"/message?order=asc", nil, &transcript))
+	require.True(t, slices.ContainsFunc(transcript.Data, func(message opencode.NativeMessage) bool { return message.ID == shellID }))
+	require.NoError(t, a.Cancel(t.Context(), wire.CancelRequest(created.SessionId)))
+	select {
+	case response := <-done:
+		require.NoError(t, <-failed)
+		require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancellation waited for the active child")
+	}
+	generation, err := store.Load(t.Context(), string(created.SessionId))
+	require.NoError(t, err)
+	var saved opencode.Export
+	require.NoError(t, json.Unmarshal(generation[""][0], &saved))
+	require.Equal(t, "idle", saved.Messages[len(saved.Messages)-1].Type)
+	require.False(t, slices.ContainsFunc(saved.Messages, func(message opencode.NativeMessage) bool { return message.ID == shellID }))
+	for _, row := range generation[""][1:] {
+		var descendant opencode.Export
+		require.NoError(t, json.Unmarshal(row, &descendant))
+		require.Empty(t, descendant.Messages)
+	}
+	var active struct {
+		Data map[string]opencode.NativeSessionStatus `json:"data"`
+	}
+	require.NoError(t, native.Do(t.Context(), "", http.MethodGet, "/api/session/active", nil, &active))
+	require.Contains(t, active.Data, child.Data.ID)
+	require.NoError(t, os.WriteFile(release, nil, 0600))
+	require.NoError(t, <-shellDone)
+	require.NoError(t, native.Interrupt(t.Context(), child.Data.ID))
+	require.NoError(t, native.Wait(t.Context(), child.Data.ID))
+	completed, err := native.Export(t.Context(), id)
+	require.NoError(t, err)
+	shellIndex := slices.IndexFunc(completed.Messages, func(message opencode.NativeMessage) bool { return message.ID == shellID })
+	markerIndex := slices.IndexFunc(completed.Messages, func(message opencode.NativeMessage) bool {
+		return message.ID == saved.Messages[len(saved.Messages)-1].ID
+	})
+	require.GreaterOrEqual(t, shellIndex, 0)
+	require.Less(t, shellIndex, markerIndex)
+	require.True(t, completed.ContainsHistory(saved))
+	finish()
+	response, err := a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "followup"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.NoError(t, a.Close())
+	for _, restoreHome := range []string{home, t.TempDir()} {
+		restored := opencodeacp.NewAgent(slices.Concat(options, []opencodeacp.Option{opencodeacp.WithHome(restoreHome), opencodeacp.WithSessionStore(copyGeneration(t, generation, created.SessionId))})...)
+		t.Cleanup(func() { _ = restored.Close() })
+		_, err = restored.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+		require.NoError(t, err)
+		_, err = restored.LoadSession(t.Context(), wire.LoadSessionRequest(created.SessionId, cwd))
+		require.NoError(t, err)
+		require.NoError(t, restored.Close())
+	}
 }

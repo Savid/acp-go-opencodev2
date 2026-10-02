@@ -880,7 +880,7 @@ func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
 			rt := s.runtime
 			s.mu.Unlock()
 
-			require.NoError(t, s.commitMirror(t.Context(), rt), "a first mirror makes the session persisted")
+			require.NoError(t, s.commitMirror(t.Context(), rt, nil), "a first mirror makes the session persisted")
 			s.openAgentCycle(t.Context(), rt)
 			s.mu.Lock()
 			require.NotNil(t, s.cycle)

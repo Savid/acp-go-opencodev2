@@ -24,9 +24,9 @@ go install github.com/savid/acp-go-opencodev2/cmd/acp-go-opencodev2@latest
 acp-go-opencodev2 [-path opencode] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-Verified against stock OpenCode 2.0.21 on 2026-10-02. The default executable is
-`opencode`; select an alternate local installation with `-path opencode2`. A bare `-path` is resolved on the inherited
-PATH. `-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
+The default executable is `opencode`; select an alternate local installation
+with `-path opencode2`. A bare `-path` is resolved on the inherited PATH.
+`-home` maps `DIR/data`, `DIR/config`, `DIR/cache`, and `DIR/state` to the
 four XDG home variables; omit it to use native home resolution. Native CLI
 continuation uses those same variables when a home was supplied.
 `-seed-file` writes a relative file inside OpenCode's configuration directory.
@@ -101,19 +101,27 @@ the gateway's response ids, and its own message and part ids are not response id
 `SessionStoreFormat` is `opencode-session-export-v1`. The main subpath holds native
 session exports for one conversation and its descendants. The `config` sidecar
 holds accepted options, captured local image bytes, and deferred synthetic inbox
-entries. Complete generations
-commit atomically before a prompt returns. The native export API supplies
-the conversation graph; matching reads with no running execution or pending
-user input, permission, or form fence each snapshot. Synthetic reminders are
-restored with their native IDs without starting execution. A directory change
-returns backpressure while native inbox entries remain pending.
+entries. A verified native snapshot commits atomically before terminal idle and
+the prompt response, including on cancellation. The execution’s terminal event
+identifies its durable idle marker in the native export. The root snapshot ends
+at that marker; each descendant ends at its latest idle marker, or has empty
+history if it has not completed an execution. A second graph read verifies the
+retained messages, configuration, and deferred inbox while later execution
+continues. Native cumulative usage and session timestamps retain their values
+at capture time and may include later execution. Commands without execution,
+configuration changes, restore, and close require matching idle graph snapshots.
+Synthetic reminders are restored with their native IDs without starting
+execution. A directory change returns backpressure while native inbox entries
+remain pending.
 
 Load imports missing sessions through the native import API and replays ACP
-history. Resume imports without replay. Existing native messages must match
-the stored prefix; newer native turns are adopted. Conflicting or shorter
-native histories are refused because the import API cannot replace a session. Local image replay remains
-available after its original file is removed. The default store is in memory;
-supply a durable store to restore across adapter restarts.
+history. Resume imports without replay. Existing native messages must preserve
+every saved message’s identity, content, and order. Newly completed assistant,
+shell, and compaction records omitted by earlier native exports may appear
+between saved messages; later turns are adopted. Conflicting or shorter native
+histories are refused because the import API cannot replace a session. Local
+image replay remains available after its original file is removed. The default
+store is in memory; supply a durable store to restore across adapter restarts.
 
 Close releases one session while peers retain the shared server. A server crash
 fails affected work, and the next operation starts a replacement and rebinds the
@@ -132,9 +140,10 @@ ACP_GO_OPENCODEV2_MODEL=provider/model make test-integration-live
 ```
 
 Unit tests use a scripted native HTTP server inside the test binary and require
-no installed OpenCode or credentials. Smoke tests use the installed CLI without
-model calls. Live tests use temporary homes and credentials supplied through
-the native environment (for example `OPENCODE_API_KEY`); they spend tokens.
+no installed OpenCode or credentials. Smoke tests use the installed CLI and a
+local stub provider without spending model tokens. Live tests use temporary
+homes and credentials supplied through the native environment (for example
+`OPENCODE_API_KEY`); they spend tokens.
 Set `ACP_GO_OPENCODEV2_HARNESS_PATH=opencode2` to test an alternate installation.
 
 ## Account usage

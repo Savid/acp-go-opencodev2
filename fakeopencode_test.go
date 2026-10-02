@@ -23,6 +23,7 @@ import (
 )
 
 const fakeOpenCodeEnv = "ACP_GO_OPENCODEV2_TEST_FAKE"
+const fakeOpenCodeEnvQueuedWake = "ACP_GO_OPENCODEV2_TEST_QUEUED_WAKE"
 const fakeOpenCodeEnvHistoryAdvance = "ACP_GO_OPENCODEV2_TEST_HISTORY_ADVANCE"
 const fakeOpenCodeEnvResumeHold = "ACP_GO_OPENCODEV2_TEST_RESUME_HOLD"
 const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODEV2_TEST_START_HOLD"
@@ -38,6 +39,7 @@ type fakeOpenCode struct {
 	sessions    map[string]*fakeExport
 	subscribers map[chan []byte]bool
 	pending     map[string]chan struct{}
+	queuedWake  map[string]bool
 	answers     map[string]chan json.RawMessage
 	environment map[string]map[string]string
 	path        string
@@ -53,7 +55,7 @@ func runFakeOpenCode(args []string) int {
 	if port == "" {
 		return 2
 	}
-	f := &fakeOpenCode{sessions: map[string]*fakeExport{}, subscribers: map[chan []byte]bool{}, pending: map[string]chan struct{}{}, answers: map[string]chan json.RawMessage{}, environment: map[string]map[string]string{}, path: filepath.Join(os.Getenv("XDG_DATA_HOME"), "opencode", "fake.json")}
+	f := &fakeOpenCode{sessions: map[string]*fakeExport{}, subscribers: map[chan []byte]bool{}, pending: map[string]chan struct{}{}, queuedWake: map[string]bool{}, answers: map[string]chan json.RawMessage{}, environment: map[string]map[string]string{}, path: filepath.Join(os.Getenv("XDG_DATA_HOME"), "opencode", "fake.json")}
 	if data, err := os.ReadFile(f.path); err == nil {
 		if json.Unmarshal(data, &f.sessions) != nil {
 			return 3
@@ -90,13 +92,16 @@ func (f *fakeOpenCode) save() {
 func (f *fakeOpenCode) publish(id, typ string, data map[string]any) {
 	data["sessionID"] = id
 	created := time.Now().UnixMilli()
-	if typ == "session.execution.succeeded" || typ == eventExecutionFailed || typ == eventExecutionInterrupted {
+	eventID := opencode.NewID("evt_")
+	if (typ == "session.execution.succeeded" || typ == eventExecutionFailed || typ == eventExecutionInterrupted) && data["reason"] != "shutdown" {
 		if session := f.sessions[id]; session != nil {
 			session.Info.Time.Idle = max(created, session.Info.Time.Idle+1)
+			message := opencode.NativeMessage{ID: strings.Replace(eventID, "evt_", "msg_", 1), Type: "idle", Outcome: strings.TrimPrefix(typ, "session.execution.")}
+			session.Messages = append(session.Messages, message)
 			f.save()
 		}
 	}
-	raw, _ := json.Marshal(map[string]any{"id": opencode.NewID("evt_"), "type": typ, "created": created, "data": data})
+	raw, _ := json.Marshal(map[string]any{"id": eventID, "type": typ, "created": created, "data": data})
 	for ch := range f.subscribers {
 		select {
 		case ch <- raw:
@@ -230,6 +235,12 @@ func (f *fakeOpenCode) sessionHTTP(w http.ResponseWriter, r *http.Request, id st
 		f.save()
 		w.WriteHeader(204)
 	case "interrupt":
+		if marker := os.Getenv(fakeOpenCodeEnvQueuedWake); marker != "" {
+			if _, err := os.Stat(marker); err == nil {
+				_ = os.Remove(marker)
+				f.queuedWake[id] = true
+			}
+		}
 		if pending := f.pending[id]; pending != nil {
 			select {
 			case <-pending:
@@ -430,20 +441,31 @@ func (f *fakeOpenCode) runPrompt(id, text, command string, pending chan struct{}
 	} else {
 		f.publish(id, "session.step.ended", map[string]any{"assistantMessageID": message.ID, "tokens": tokens, "finish": "stop", "cost": 0})
 	}
-	session.Messages = append(session.Messages, message, opencode.NativeMessage{ID: opencode.NewMessageID(), Type: "idle", Outcome: outcome})
+	session.Messages = append(session.Messages, message)
 	session.Info.Outcome = outcome
 	terminal := map[string]any{}
 	if text == "ERROR" {
 		outcome = "failed"
 		session.Info.Outcome = outcome
-		session.Messages[len(session.Messages)-1].Outcome = outcome
 		terminal["error"] = map[string]any{"type": "rate_limit", "message": "account rate limit", "status": 429}
+	}
+	if text == "SHUTDOWN" {
+		outcome = "interrupted"
+		terminal["reason"] = "shutdown"
 	}
 	if text == "FORGET" {
 		delete(f.sessions, id)
 	}
 	f.save()
 	f.publish(id, "session.execution."+outcome, terminal)
+	if f.queuedWake[id] {
+		delete(f.queuedWake, id)
+		next := make(chan struct{})
+		f.pending[id] = next
+		session.Messages = append(session.Messages, opencode.NativeMessage{ID: opencode.NewMessageID(), Type: "synthetic", Text: "queued wake"})
+		f.save()
+		go f.runPrompt(id, "SLOW", "", next)
+	}
 	f.mu.Unlock()
 }
 
@@ -673,14 +695,17 @@ func (f *fakeOpenCode) persistenceHTTP(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if pieces[4] == "wait" {
-		pending := f.pending[id]
-		if pending != nil {
+		for f.pending[id] != nil {
+			pending := f.pending[id]
 			f.mu.Unlock()
 			select {
 			case <-pending:
 			case <-r.Context().Done():
 			}
 			f.mu.Lock()
+			if r.Context().Err() != nil {
+				return
+			}
 		}
 		w.WriteHeader(204)
 

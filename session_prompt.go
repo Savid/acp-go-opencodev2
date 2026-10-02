@@ -232,7 +232,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 		s.mu.Lock()
 		t.command = true
-		t.seenIdle = native.Time.Idle
+		t.initialIdle = native.Time.Idle
 		s.mu.Unlock()
 	}
 
@@ -243,8 +243,17 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 		err := rt.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(s.nativeID)+path, body, nil)
 		// An interrupt sent before admission cannot cancel work accepted later.
-		if turnCtx.Err() != nil {
+		s.mu.Lock()
+
+		interrupt := t.cancelled && !t.settling
+		if interrupt {
+			s.callbacks.Add(1)
+		}
+		s.mu.Unlock()
+
+		if interrupt {
 			s.abort(ctx, rt)
+			s.callbacks.Done()
 		}
 
 		var idle int64
@@ -282,12 +291,8 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	return s.settleTurn(ctx, rt, t, params)
 }
 
-// finishCommand waits for the stream to reach the native command's idle watermark.
+// finishCommand settles a command that returned without starting execution.
 func (s *session) finishCommand(ctx context.Context, t *turn) {
-	if !t.commandDone || t.seenIdle < t.commandIdle {
-		return
-	}
-
 	if t.state.stopReason == "" {
 		t.state.stopReason = statusComplete
 	}
@@ -392,7 +397,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 
-		if err := s.commitMirror(settleCtx, rt); err != nil {
+		if err := s.commitMirror(settleCtx, rt, t.terminalEvent); err != nil {
 			s.stopRuntime(settleCtx, rt)
 			s.fenceStream()
 

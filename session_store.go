@@ -6,8 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
-	"net/http"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -110,10 +108,10 @@ func validNativeSessionID(id string) bool {
 	return true
 }
 
-// commitMirror atomically stores a complete native snapshot and its
+// commitMirror atomically stores a verified native snapshot and its
 // configuration. An ephemeral session commits nothing: opencode's own database
 // holds it until the host deletes it.
-func (s *session) commitMirror(ctx context.Context, rt *binding) error {
+func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *opencode.Event) error {
 	if s.ephemeral {
 		return nil
 	}
@@ -121,13 +119,13 @@ func (s *session) commitMirror(ctx context.Context, rt *binding) error {
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 
-	if rt != nil {
+	if rt != nil && terminal == nil {
 		if err := rt.client.Wait(ctx, s.nativeID); err != nil {
 			return err
 		}
 	}
 
-	rows, err := s.snapshotRows(ctx, rt)
+	rows, err := s.snapshotRows(ctx, rt, terminal)
 	if err != nil {
 		return err
 	}
@@ -145,14 +143,13 @@ func (s *session) commitMirror(ctx context.Context, rt *binding) error {
 	return err
 }
 
-// snapshotRows reads the whole native history of this session. A commit that
-// cannot be attempted is an error: the turn it belongs to is not durable.
-func (s *session) snapshotRows(ctx context.Context, rt *binding) ([][]byte, error) {
+// snapshotRows captures exported native history and its referenced output images.
+func (s *session) snapshotRows(ctx context.Context, rt *binding, terminal *opencode.Event) ([][]byte, error) {
 	if rt == nil {
 		return nil, errors.New("session has no native binding")
 	}
 
-	rows, err := s.readNativeRows(ctx, rt)
+	rows, err := s.readNativeRows(ctx, rt, terminal)
 	if err != nil {
 		return nil, err
 	}
@@ -259,131 +256,6 @@ func decodeExports(rows [][]byte, id string) ([]opencode.Export, error) {
 	return exports, nil
 }
 
-const snapshotAttempts = 5
-const snapshotRetryDelay = 100 * time.Millisecond
-
-// readNativeRows fences the full graph with two matching exports and idle checks.
-func (s *session) readNativeRows(ctx context.Context, rt *binding) ([][]byte, error) {
-	for range snapshotAttempts {
-		first, err := s.exportGraph(ctx, rt)
-		if err != nil {
-			return nil, err
-		}
-
-		if idleErr := s.requireNativeIdle(ctx, rt, first); idleErr != nil {
-			return nil, idleErr
-		}
-
-		second, err := s.exportGraph(ctx, rt)
-		if err != nil {
-			return nil, err
-		}
-
-		if reflect.DeepEqual(first, second) {
-			if err := s.requireNativeIdle(ctx, rt, second); err != nil {
-				return nil, err
-			}
-
-			inputs := make(map[string][]opencode.InboxInput)
-
-			rows := make([][]byte, 0, len(second))
-			for i := range second {
-				item := &second[i]
-
-				rows = append(rows, append([]byte(nil), item.Raw...))
-				if len(item.Inbox) > 0 {
-					inputs[item.Info.ID] = item.Inbox
-				}
-			}
-
-			s.mu.Lock()
-			s.pendingInputs = inputs
-			s.mu.Unlock()
-
-			return rows, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(snapshotRetryDelay):
-		}
-	}
-
-	return nil, errors.New("native history changed while snapshotting")
-}
-
-type nativeSnapshot struct {
-	opencode.Export
-	Inbox []opencode.InboxInput
-}
-
-func (s *session) exportGraph(ctx context.Context, rt *binding) ([]nativeSnapshot, error) {
-	var exports []nativeSnapshot
-
-	pending := []string{s.nativeID}
-	seen := map[string]bool{}
-
-	for len(pending) > 0 {
-		id := pending[0]
-		pending = pending[1:]
-
-		if seen[id] {
-			return nil, errors.New("native session graph cycle")
-		}
-
-		seen[id] = true
-
-		item, err := rt.client.Export(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-
-		inbox, err := rt.client.Inbox(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-
-		exports = append(exports, nativeSnapshot{Export: item, Inbox: inbox})
-		cursor := ""
-
-		for {
-			var children struct {
-				Data   []opencode.NativeSession `json:"data"`
-				Cursor struct {
-					Next string `json:"next"`
-				} `json:"cursor"`
-			}
-
-			path := "/api/session?parentID=" + url.QueryEscape(id) + "&order=asc&limit=100"
-			if cursor != "" {
-				path += "&cursor=" + url.QueryEscape(cursor)
-			}
-
-			if err := rt.client.Do(ctx, "", http.MethodGet, path, nil, &children); err != nil {
-				return nil, err
-			}
-
-			for i := range children.Data {
-				child := &children.Data[i]
-				pending = append(pending, child.ID)
-			}
-
-			if children.Cursor.Next == "" {
-				break
-			}
-
-			if children.Cursor.Next == cursor {
-				return nil, errors.New("native pagination did not advance")
-			}
-
-			cursor = children.Cursor.Next
-		}
-	}
-
-	return exports, nil
-}
-
 // hydrate imports absent conversations and adopts a longer native transcript.
 // The native API cannot replace an existing shorter transcript, so that case fails closed.
 func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([][]byte, error) {
@@ -423,20 +295,13 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 		case readErr != nil:
 			return nil, s.agent.restoreRefused(ctx, s.id, readErr)
 		default:
-			if len(current.Messages) < len(saved.Messages) {
-				return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native transcript is shorter than its mirror"))
-			}
-
-			for index := range saved.Messages {
-				message := &saved.Messages[index]
-				if !sameJSON(message.Raw, current.Messages[index].Raw) {
-					return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native history conflicts with mirror"))
-				}
+			if !current.ContainsHistory(*saved) {
+				return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native history conflicts with mirror"))
 			}
 		}
 	}
 
-	rows, err := s.readNativeRows(ctx, rt)
+	rows, err := s.readNativeRows(ctx, rt, nil)
 	if err != nil {
 		return nil, s.agent.restoreRefused(ctx, s.id, err)
 	}
@@ -465,15 +330,8 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 			return nil, s.agent.restoreRefused(ctx, s.id, pendingErr)
 		}
 
-		if len(current.Messages) < len(saved.Messages) {
-			return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native import incomplete"))
-		}
-
-		for index := range saved.Messages {
-			message := &saved.Messages[index]
-			if !sameJSON(message.Raw, current.Messages[index].Raw) {
-				return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native import changed message content"))
-			}
+		if !current.ContainsHistory(*saved) {
+			return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native import changed message content"))
 		}
 	}
 
@@ -540,37 +398,6 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 
 	return nil
 }
-func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph []nativeSnapshot) error {
-	var active struct {
-		Data map[string]opencode.NativeSessionStatus `json:"data"`
-	}
-	if err := rt.client.Do(ctx, "", http.MethodGet, "/api/session/active", nil, &active); err != nil {
-		return err
-	}
-
-	for i := range graph {
-		item := &graph[i]
-		if _, ok := active.Data[item.Info.ID]; ok {
-			return errors.New("native session is still running")
-		}
-
-		for _, suffix := range []string{"/form", "/permission"} {
-			var pending struct {
-				Data []json.RawMessage `json:"data"`
-			}
-			if err := rt.client.Do(ctx, "", http.MethodGet, opencode.SessionPath(item.Info.ID)+suffix, nil, &pending); err != nil {
-				return err
-			}
-
-			if len(pending.Data) > 0 {
-				return errors.New("native session has pending input")
-			}
-		}
-	}
-
-	return nil
-}
-
 func clonePendingInputs(inputs map[string][]opencode.InboxInput) map[string][]opencode.InboxInput {
 	result := make(map[string][]opencode.InboxInput, len(inputs))
 	for id, rows := range inputs {

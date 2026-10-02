@@ -118,13 +118,13 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 		return statuses.Data[child.ID].Type == "running"
 	}, 5*time.Second, 10*time.Millisecond)
 
-	require.ErrorContains(t, s.commitMirror(t.Context(), rt), "native session is still running")
+	require.ErrorContains(t, s.commitMirror(t.Context(), rt, nil), "native session is still running")
 
 	require.NoError(t, rt.client.Interrupt(t.Context(), child.ID))
 	require.NoError(t, rt.client.Wait(t.Context(), child.ID))
 	stop()
 	<-done
-	require.NoError(t, s.commitMirror(t.Context(), rt))
+	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
 	var record sessionRecord
 	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
 	require.NoError(t, err)
@@ -165,7 +165,7 @@ func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	}
 	unrelated, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
-	require.NoError(t, s.commitMirror(t.Context(), rt))
+	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
 	var record sessionRecord
 	rows, found, err := sessionlog.Load(t.Context(), store, string(root.SessionId), &record)
 	require.NoError(t, err)
@@ -201,7 +201,7 @@ func TestMirrorCommitRefusesWhatItCannotAttempt(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 
-	require.Error(t, s.commitMirror(t.Context(), nil),
+	require.Error(t, s.commitMirror(t.Context(), nil, nil),
 		"a commit with no binding to read the native history through cannot be attempted")
 
 	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "FORGET"))

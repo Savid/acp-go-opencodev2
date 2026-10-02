@@ -88,6 +88,7 @@ type eventData struct {
 	Error              *opencode.NativeError `json:"error"`
 	Tokens             opencode.NativeTokens `json:"tokens"`
 	Cost               float64               `json:"cost"`
+	Reason             string                `json:"reason"`
 	Finish             string                `json:"finish"`
 }
 
@@ -123,6 +124,12 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 	var data eventData
 	if json.Unmarshal(event.Data, &data) != nil {
+		rt.cancel()
+
+		return
+	}
+
+	if event.Type == eventExecutionInterrupted && data.Reason == "shutdown" {
 		rt.cancel()
 
 		return
@@ -191,13 +198,9 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		c.state.stopReason = statusComplete
 	}
 
-	if t != nil {
-		if t.command {
-			t.seenIdle = max(t.seenIdle+1, event.Created)
-			s.finishCommand(ctx, t)
+	c.terminalEvent = &event
 
-			return
-		}
+	if t != nil {
 		// This event is ordered after all model and tool events in this execution.
 		s.beginSettlement(c)
 		t.settle(turnSettled)
@@ -586,7 +589,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 		c.state.stopReason = statusComplete
 	}
 
-	if err := s.commitMirror(settleCtx, rt); err != nil {
+	if err := s.commitMirror(settleCtx, rt, c.terminalEvent); err != nil {
 		s.recordFailure(c, s.mirrorFailure(&c.state, err))
 		s.fenceStream()
 		// A fenced incarnation is terminal, so the binding ends with it and the

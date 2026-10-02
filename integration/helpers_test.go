@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +24,9 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
 
 const testTimeout = 120 * time.Second
@@ -260,4 +265,89 @@ func agentText(updates []acp.SessionNotification) string {
 	}
 
 	return text.String()
+}
+
+func localStreamingModel(t *testing.T) (string, <-chan struct{}, func()) {
+	t.Helper()
+	requests := make(chan struct{}, 16)
+	finish := make(chan struct{})
+	var once sync.Once
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tools []json.RawMessage `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		send := func(delta map[string]string, stop any) {
+			data, _ := json.Marshal(map[string]any{"id": "local-response", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": "probe", "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": stop}}})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		send(map[string]string{"role": "assistant", "content": "partial reply"}, nil)
+		if len(body.Tools) > 0 {
+			requests <- struct{}{}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-finish:
+			}
+		}
+		send(map[string]string{}, "stop")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(provider.Close)
+	config, err := json.Marshal(map[string]any{"providers": map[string]any{"probe": map[string]any{
+		"package":  "@opencode/ai/providers/openai-compatible",
+		"settings": map[string]any{"baseURL": provider.URL + "/v1", "apiKey": "local-probe"},
+		"models":   map[string]any{"probe": map[string]any{"name": "Probe", "limit": map[string]any{"context": 32000, "output": 2000}, "capabilities": map[string]any{"tools": true, "input": []string{"text"}, "output": []string{"text"}}}},
+	}}})
+	require.NoError(t, err)
+
+	return string(config), requests, func() { once.Do(func() { close(finish) }) }
+}
+
+// nativeEndpoint records the child credentials in the isolated test directory
+// and reads the endpoint published for the adapter's native plugin.
+func nativeEndpoint(t *testing.T) (opencodeacp.Option, opencodeacp.Option, func() *opencode.Client) {
+	t.Helper()
+	root := t.TempDir()
+	scratch := t.TempDir()
+	passwordPath := filepath.Join(root, "password")
+	wrapper := filepath.Join(root, "opencode")
+	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
+	script := "#!/bin/sh\nif [ \"$1\" = serve ]; then\n  printf '%s' \"$OPENCODE_SERVER_PASSWORD\" > " + quote(passwordPath) + "\nfi\nexec " + quote(harnessPath(t)) + " \"$@\"\n"
+	require.NoError(t, os.WriteFile(wrapper, []byte(script), 0700))
+
+	return opencodeacp.WithExecutablePath(wrapper), opencodeacp.WithScratchDir(scratch), func() *opencode.Client {
+		endpoints, err := filepath.Glob(filepath.Join(scratch, "*", "endpoint"))
+		require.NoError(t, err)
+		require.Len(t, endpoints, 1)
+		address, err := os.ReadFile(endpoints[0])
+		require.NoError(t, err)
+		password, err := os.ReadFile(passwordPath)
+		require.NoError(t, err)
+		client := opencode.NewClient()
+		client.URL = string(address)
+		client.Password = string(password)
+
+		return client
+	}
+}
+
+func copyGeneration(t *testing.T, generation map[string][]acpcore.SessionStoreEntry, id acp.SessionId) *acpcore.InMemorySessionStore {
+	t.Helper()
+	store := acpcore.NewInMemorySessionStore()
+	replacements := make([]acpcore.SessionStoreReplacement, 0, len(generation))
+	for subpath, entries := range generation {
+		replacements = append(replacements, acpcore.SessionStoreReplacement{Key: acpcore.SessionKey{SessionID: string(id), Subpath: subpath}, Entries: entries})
+	}
+	require.NoError(t, store.Replace(t.Context(), acpcore.SessionKey{SessionID: string(id)}, replacements))
+
+	return store
 }

@@ -222,7 +222,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		return acp.NewSessionResponse{}, err
 	}
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		a.log.ErrorContext(ctx, "initial mirror commit failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 		release()
@@ -430,7 +430,7 @@ func (a *Agent) restore(
 		return nil, nil, err
 	}
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		release()
 
 		_ = s.close(context.WithoutCancel(ctx))
@@ -492,7 +492,7 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 		}
 	}
 
-	if err := s.commitMirror(ctx, rt); err != nil {
+	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		return nil, nil, a.restoreRefused(ctx, s.id, err)
 	}
 
@@ -502,7 +502,7 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 		var err error
 
 		if s.ephemeral {
-			rows, err = s.snapshotRows(ctx, rt)
+			rows, err = s.snapshotRows(ctx, rt, nil)
 		} else {
 			var stored storedSession
 

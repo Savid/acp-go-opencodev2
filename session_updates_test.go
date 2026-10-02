@@ -116,6 +116,26 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			data = []byte(strings.ReplaceAll(string(data), "fixture-session", string(s.id)))
 			var frames []json.RawMessage
 			require.NoError(t, json.Unmarshal(data, &frames))
+			var terminal opencode.Event
+			require.NoError(t, json.Unmarshal(frames[len(frames)-1], &terminal))
+			native, err := rt.client.Export(t.Context(), s.nativeID)
+			require.NoError(t, err)
+			marker := opencode.NativeMessage{ID: strings.Replace(terminal.ID, "evt_", "msg_", 1), Type: "idle", Outcome: "succeeded"}
+			var fixtureActive atomic.Bool
+			fixtureActive.Store(true)
+			target, err := url.Parse(rt.client.URL)
+			require.NoError(t, err)
+			forward := httputil.NewSingleHostReverseProxy(target)
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if fixtureActive.Load() && strings.HasSuffix(r.URL.Path, "/export") {
+					fakeData(w, fakeExport{Info: native.Info, Messages: []opencode.NativeMessage{marker}})
+
+					return
+				}
+				forward.ServeHTTP(w, r)
+			}))
+			t.Cleanup(proxy.Close)
+			rt.client.URL = proxy.URL
 			trace.reset()
 			store.fail.Store(failCommit)
 			for _, frame := range frames {
@@ -139,6 +159,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 
 				return settled && len(entries) > 0 && entries[len(entries)-1] == "idle"
 			}, testTimeout, time.Millisecond)
+			fixtureActive.Store(false)
 			require.NotEmpty(t, trace.snapshot())
 			require.Equal(t, "running", trace.snapshot()[0])
 			for _, event := range lifecycleEvents(rec.snapshot()) {
