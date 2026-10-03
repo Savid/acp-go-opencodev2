@@ -29,6 +29,11 @@ const fakeOpenCodeEnvResumeHold = "ACP_GO_OPENCODEV2_TEST_RESUME_HOLD"
 const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODEV2_TEST_START_HOLD"
 const fakeOpenCodeEnvHealthHold = "ACP_GO_OPENCODEV2_TEST_HEALTH_HOLD"
 
+// fakeOpenCodeEnvNativeWork names a file the fake appends one line to for
+// each server start and each request that creates, imports, or binds a native
+// session.
+const fakeOpenCodeEnvNativeWork = "ACP_GO_OPENCODEV2_TEST_NATIVE_WORK"
+
 type fakeExport struct {
 	Info     opencode.NativeSession   `json:"info"`
 	Messages []opencode.NativeMessage `json:"messages"`
@@ -55,6 +60,7 @@ func runFakeOpenCode(args []string) int {
 	if port == "" {
 		return 2
 	}
+	recordNativeWork("start")
 	f := &fakeOpenCode{sessions: map[string]*fakeExport{}, subscribers: map[chan []byte]bool{}, pending: map[string]chan struct{}{}, queuedWake: map[string]bool{}, answers: map[string]chan json.RawMessage{}, environment: map[string]map[string]string{}, path: filepath.Join(os.Getenv("XDG_DATA_HOME"), "opencode", "fake.json")}
 	if data, err := os.ReadFile(f.path); err == nil {
 		if json.Unmarshal(data, &f.sessions) != nil {
@@ -83,6 +89,20 @@ func runFakeOpenCode(args []string) int {
 	}
 
 	return 0
+}
+
+// recordNativeWork appends one line naming kind to the native-work file.
+func recordNativeWork(kind string) {
+	path := os.Getenv(fakeOpenCodeEnvNativeWork)
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		panic(err)
+	}
+	_, _ = file.WriteString(kind + "\n")
+	_ = file.Close()
 }
 func (f *fakeOpenCode) save() {
 	data, _ := json.Marshal(f.sessions)
@@ -168,6 +188,7 @@ func (f *fakeOpenCode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeOpenCode) sessionHTTP(w http.ResponseWriter, r *http.Request, id string, session *fakeExport, pieces []string) {
 	if len(pieces) == 3 {
+		recordNativeWork("bind")
 		if r.Method == http.MethodPatch {
 			var body struct {
 				Metadata map[string]any `json:"metadata"`
@@ -506,6 +527,7 @@ func (f *fakeOpenCode) globalHTTP(w http.ResponseWriter, r *http.Request) bool {
 
 		return true
 	case "/api/experimental/session/import":
+		recordNativeWork("import")
 		var body struct {
 			fakeExport
 			Location opencode.Location `json:"location"`
@@ -543,6 +565,7 @@ func (f *fakeOpenCode) globalHTTP(w http.ResponseWriter, r *http.Request) bool {
 
 			return true
 		}
+		recordNativeWork("create")
 		var session opencode.NativeSession
 		if json.NewDecoder(r.Body).Decode(&session) != nil {
 			w.WriteHeader(400)

@@ -50,6 +50,20 @@ func testOptions(t *testing.T, extra ...Option) []Option {
 	return append(options, extra...)
 }
 
+// nativeWork counts the native operations the fake has recorded in path.
+func nativeWork(t *testing.T, path string) int {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+
+	require.NoError(t, err)
+
+	return strings.Count(string(data), "\n")
+}
+
 // recorder is the ACP client the tests observe the agent through.
 type recorder struct {
 	mu          sync.Mutex
