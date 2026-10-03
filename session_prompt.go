@@ -242,16 +242,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		defer close(requestDone)
 
 		err := rt.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(s.nativeID)+path, body, nil)
-		// An interrupt sent before admission cannot cancel work accepted later.
-		s.mu.Lock()
-
-		interrupt := t.cancelled && !t.settling
-		if interrupt {
-			s.callbacks.Add(1)
-		}
-		s.mu.Unlock()
-
-		if interrupt {
+		if s.repeatInterrupt(t) {
 			s.abort(ctx, rt)
 			s.callbacks.Done()
 		}

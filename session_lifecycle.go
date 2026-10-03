@@ -67,6 +67,12 @@ func (s *session) fenceStream() {
 }
 
 func (s *session) acceptTurn(ctx context.Context, t *turn) {
+	s.mu.Lock()
+	if !t.cancelled {
+		t.acceptedBeforeCancel = true
+	}
+	s.mu.Unlock()
+
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
