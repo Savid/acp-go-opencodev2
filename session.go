@@ -129,6 +129,10 @@ type turn struct {
 	messageID   string
 	command     bool
 	initialIdle int64
+	// acceptedBeforeCancel records, under the session lock, that native
+	// acceptance was observed before the turn was cancelled, so the cancel's
+	// interrupt reached the accepted work.
+	acceptedBeforeCancel bool
 }
 
 func (t *turn) settle(end turnEnd) {
@@ -405,6 +409,23 @@ func (s *session) cancel(ctx context.Context) {
 			s.abort(ctx, rt)
 		}()
 	}
+}
+
+// repeatInterrupt reports whether a cancelled turn's interrupt must be sent
+// again once its prompt request returns, and admits the repeat as a settlement
+// callback. An interrupt sent before admission cannot cancel work accepted
+// later; one sent after observed acceptance already reached it, and repeating
+// it could end native successor work.
+func (s *session) repeatInterrupt(t *turn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	repeat := t.cancelled && !t.settling && !t.acceptedBeforeCancel
+	if repeat {
+		s.callbacks.Add(1)
+	}
+
+	return repeat
 }
 
 // beginSettlement closes callback admission before joining native interrupts

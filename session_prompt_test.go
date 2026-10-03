@@ -443,6 +443,12 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	target, err := url.Parse(native.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
+	cancelled := make(chan struct{})
+	if mode == "queued" {
+		// Native admits the prompt and the adapter observes it on the event
+		// stream, but the prompt request returns only after the cancel.
+		holdPromptResponses(ctx, forward, cancelled)
+	}
 	var armed, woke atomic.Bool
 	wakeErrors := make(chan error, 1)
 	wake := func() {
@@ -507,6 +513,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 		armed.Store(true)
 		require.NoError(t, a.Cancel(ctx, wire.CancelRequest(s.id)))
 	}
+	close(cancelled)
 	var got result
 	select {
 	case got = <-done:
@@ -596,6 +603,22 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	require.NoError(t, err)
 	_, err = restored.LoadSession(ctx, wire.LoadSessionRequest(s.id, s.cwd))
 	require.NoError(t, err)
+}
+
+// holdPromptResponses delays each prompt response through proxy until release
+// closes or ctx ends.
+func holdPromptResponses(ctx context.Context, proxy *httputil.ReverseProxy, release <-chan struct{}) {
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if strings.HasSuffix(response.Request.URL.Path, "/prompt") {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			case <-response.Request.Context().Done():
+			}
+		}
+
+		return nil
+	}
 }
 
 func requireCommittedBeforeResponse(t *testing.T, entries []string) {
