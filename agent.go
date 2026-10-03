@@ -76,7 +76,10 @@ type Agent struct {
 	lifecycle lifecycle.Negotiated
 	restores  wire.SessionRequests
 	sessions  map[acp.SessionId]*session
-	deleted   map[acp.SessionId]bool
+	// starting counts the establishing requests that hold an active-session
+	// slot but have not installed their session yet.
+	starting int
+	deleted  map[acp.SessionId]bool
 	// ephemeral holds the ids the host opened as ephemeral, kept past close so
 	// their delete never touches the store.
 	ephemeral   map[acp.SessionId]bool

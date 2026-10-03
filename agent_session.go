@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -85,7 +86,32 @@ func (a *Agent) newSession(start sessionStart) *session {
 	return s
 }
 
-// install publishes a configured session under its ACP id.
+// reserveSlot holds one active-session slot for an establishing request
+// before it does any native work. The returned release is idempotent; the
+// request calls it once its session is installed or it fails.
+func (a *Agent) reserveSlot() (func(), error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return nil, wire.AgentClosed()
+	}
+
+	if len(a.sessions)+a.starting >= a.options.ConcurrencyLimits.MaxActiveSessions {
+		return nil, wire.Backpressure(limitActiveSessions)
+	}
+
+	a.starting++
+
+	return sync.OnceFunc(func() {
+		a.mu.Lock()
+		a.starting--
+		a.mu.Unlock()
+	}), nil
+}
+
+// install publishes a configured session under its ACP id. The caller holds
+// the session's reserved slot.
 func (a *Agent) install(ctx context.Context, s *session) error {
 	a.mu.Lock()
 
@@ -98,8 +124,6 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 		refusal = wire.UnknownSession()
 	case a.sessions[s.id] != nil:
 		refusal = wire.InternalFailure(vendor, internalClassNativeStart)
-	case len(a.sessions) >= a.options.ConcurrencyLimits.MaxActiveSessions:
-		refusal = wire.Backpressure(limitActiveSessions)
 	}
 
 	if refusal == nil {
@@ -191,6 +215,12 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 	start.ephemeral = hostMeta.Ephemeral
 
+	releaseSlot, err := a.reserveSlot()
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	defer releaseSlot()
+
 	s := a.newSession(start)
 
 	rt, err := s.launch(ctx)
@@ -221,6 +251,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 		return acp.NewSessionResponse{}, err
 	}
+
+	releaseSlot()
 
 	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		a.log.ErrorContext(ctx, "initial mirror commit failed",
@@ -389,6 +421,12 @@ func (a *Agent) restore(
 		start.additionalDirectories = slices.Clone(stored.record.AdditionalDirectories)
 	}
 
+	releaseSlot, err := a.reserveSlot()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseSlot()
+
 	s := a.newSession(start)
 	s.id = sessionID
 	s.nativeID = stored.record.NativeSessionID
@@ -429,6 +467,8 @@ func (a *Agent) restore(
 
 		return nil, nil, err
 	}
+
+	releaseSlot()
 
 	if err := s.commitMirror(ctx, rt, nil); err != nil {
 		release()
