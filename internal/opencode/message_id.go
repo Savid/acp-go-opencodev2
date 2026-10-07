@@ -3,6 +3,7 @@ package opencode
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,4 +44,14 @@ func NewMessageID() string {
 	}
 
 	return "msg_" + hex.EncodeToString(data) + string(tail)
+}
+
+// MessageID is the native message identity derived from a durable event.
+func (e Event) MessageID() string {
+	suffix, ok := strings.CutPrefix(e.ID, "evt_")
+	if !ok || suffix == "" {
+		return ""
+	}
+
+	return "msg_" + suffix
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,9 @@ import (
 )
 
 const (
+	eventCompactionStarted    = "session.compaction.started"
+	eventCompactionEnded      = "session.compaction.ended"
+	eventCompactionFailed     = "session.compaction.failed"
 	eventReasoningDelta       = "session.reasoning.delta"
 	eventReasoningEnded       = "session.reasoning.ended"
 	eventToolFailed           = "session.tool.failed"
@@ -74,6 +78,7 @@ func (state *cycleState) init() {
 
 //nolint:tagliatelle // Native event identities use uppercase ID suffixes.
 type eventData struct {
+	InputID            string                `json:"inputID"`
 	SessionID          string                `json:"sessionID"`
 	AssistantMessageID string                `json:"assistantMessageID"`
 	InboxID            string                `json:"inboxID"`
@@ -117,7 +122,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	s.emitRawEvent(ctx, event)
 
 	switch event.Type {
-	case "session.deleted", "todo.updated", "session.inbox.enqueued", eventExecutionStarted, "session.execution.succeeded", eventExecutionFailed, eventExecutionInterrupted, "session.step.started", "session.step.ended", "session.step.failed", "session.text.delta", eventReasoningDelta, "session.text.ended", eventReasoningEnded, "session.tool.input.started", "session.tool.called", "session.tool.success", eventToolFailed, "session.compaction.ended", "session.compaction.failed", eventPermissionAsked, eventFormCreated:
+	case "session.deleted", "todo.updated", "session.inbox.enqueued", eventExecutionStarted, "session.execution.succeeded", eventExecutionFailed, eventExecutionInterrupted, "session.step.started", "session.step.ended", "session.step.failed", "session.text.delta", eventReasoningDelta, "session.text.ended", eventReasoningEnded, "session.tool.input.started", "session.tool.called", "session.tool.success", eventToolFailed, eventCompactionStarted, eventCompactionEnded, eventCompactionFailed, eventPermissionAsked, eventFormCreated:
 	default:
 		return
 	}
@@ -146,6 +151,11 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		_ = s.emitPlan(ctx, event.Data)
 
 		return
+	}
+
+	if err := s.projectCompaction(ctx, event, data); err != nil {
+		s.agent.log.WarnContext(ctx, "compaction notification failed",
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
 
 	control := event.Type == eventPermissionAsked || event.Type == eventFormCreated
@@ -262,7 +272,7 @@ func (s *session) projectEvent(ctx context.Context, c *cycle, event opencode.Eve
 		}
 
 		return s.emitResponseUsage(ctx, c, message)
-	case "session.compaction.ended", "session.compaction.failed":
+	case eventCompactionEnded, eventCompactionFailed:
 		// The compaction response consumes tokens but does not describe the new context.
 		if callUsage(data.Tokens).Known() {
 			state.usage = addUsage(state.usage, data.Tokens)

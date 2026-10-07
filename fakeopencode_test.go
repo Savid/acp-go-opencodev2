@@ -364,7 +364,8 @@ func (f *fakeOpenCode) runPrompt(id, text, command string, pending chan struct{}
 		tokens = fakeTokens(50, 1120, 30)
 	case "COMPACT":
 		f.call(id, "first", fakeTokens(100, 1000, 20))
-		f.publish(id, "session.compaction.ended", map[string]any{"tokens": fakeTokens(1120, 0, 200)})
+		f.publish(id, "session.compaction.started", map[string]any{"reason": "auto", "recent": ""})
+		f.publish(id, "session.compaction.ended", map[string]any{"reason": "auto", "tokens": fakeTokens(1120, 0, 200)})
 		tokens = fakeTokens(300, 0, 20)
 	case "COMPACTFAIL":
 		f.publish(id, "session.compaction.failed", map[string]any{"tokens": fakeTokens(1120, 0, 200), "error": map[string]string{"type": "compaction.failed", "message": "Summary format invalid"}})

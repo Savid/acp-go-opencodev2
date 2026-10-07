@@ -11,8 +11,8 @@ import (
 
 // ExecutionPrefix cuts the export at the terminal event's durable idle marker.
 func (e Export) ExecutionPrefix(event Event) (Export, error) {
-	suffix, ok := strings.CutPrefix(event.ID, "evt_")
-	if !ok || suffix == "" || event.SessionID() != e.Info.ID {
+	messageID := event.MessageID()
+	if messageID == "" || event.SessionID() != e.Info.ID {
 		return Export{}, errors.New("invalid native execution boundary")
 	}
 
@@ -23,7 +23,7 @@ func (e Export) ExecutionPrefix(event Event) (Export, error) {
 
 	for i := range e.Messages {
 		message := &e.Messages[i]
-		if message.ID == "msg_"+suffix && message.Type == "idle" && message.Outcome == outcome {
+		if message.ID == messageID && message.Type == "idle" && message.Outcome == outcome {
 			return e.messagePrefix(i + 1)
 		}
 	}
