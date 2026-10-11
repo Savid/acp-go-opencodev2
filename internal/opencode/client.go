@@ -34,6 +34,17 @@ type Client struct {
 	URL      string
 	Password string
 	http     *http.Client
+	// bodyLimit bounds one JSON response, or one exported message; zero
+	// means MaxBodyBytes.
+	bodyLimit int
+}
+
+func (c *Client) limit() int {
+	if c.bodyLimit > 0 {
+		return c.bodyLimit
+	}
+
+	return MaxBodyBytes
 }
 
 type HTTPError struct {
@@ -137,12 +148,12 @@ func (c *Client) Do(ctx context.Context, directory, method, path string, body, o
 	}
 	defer response.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(response.Body, MaxBodyBytes+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, int64(c.limit())+1))
 	if err != nil {
 		return err
 	}
 
-	if len(data) > MaxBodyBytes {
+	if len(data) > c.limit() {
 		return errors.New("opencode response exceeds size limit")
 	}
 
@@ -185,14 +196,27 @@ func (c *Client) Session(ctx context.Context, id string) (NativeSession, error) 
 
 	return out.Data, err
 }
+
+// Export reads one whole session export as it streams, so its size is bounded
+// per message rather than in total.
 func (c *Client) Export(ctx context.Context, id string) (Export, error) {
-	var out struct {
-		Data Export `json:"data"`
+	var export Export
+
+	err := c.StreamExport(ctx, id, func(info json.RawMessage) error {
+		export.InfoRaw = info
+
+		return json.Unmarshal(info, &export.Info)
+	}, func(raw []byte) error {
+		message, err := ParseMessage(bytes.Clone(raw))
+		export.Messages = append(export.Messages, message)
+
+		return err
+	})
+	if err == nil && export.InfoRaw == nil {
+		err = errors.New("native export information missing")
 	}
 
-	err := c.Do(ctx, "", http.MethodGet, "/api/experimental/session/"+url.PathEscape(id)+"/export", nil, &out)
-
-	return out.Data, err
+	return export, err
 }
 
 // StreamExport reads one session export as it arrives: info receives the
@@ -245,7 +269,7 @@ func (c *Client) StreamExport(ctx context.Context, id string, info func(json.Raw
 						return err
 					}
 
-					if len(value) > MaxBodyBytes {
+					if len(value) > c.limit() {
 						return errors.New("opencode message exceeds size limit")
 					}
 

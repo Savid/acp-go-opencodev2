@@ -3,6 +3,7 @@ package opencode
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -53,4 +54,31 @@ func TestClientRequiresJSON(t *testing.T) {
 		var protocol *ProtocolError
 		require.ErrorAs(t, err, &protocol)
 	}
+}
+
+func TestExportBoundsEachMessageNotTheWhole(t *testing.T) {
+	t.Parallel()
+	text := strings.Repeat("x", 200)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		messages := make([]string, 0, 20)
+		for i := range 20 {
+			messages = append(messages, `{"id":"msg_`+strconv.Itoa(i)+`","type":"user","text":"`+text+`"}`)
+		}
+		if strings.Contains(r.URL.Path, "large") {
+			messages = append(messages, `{"id":"msg_large","type":"user","text":"`+strings.Repeat("y", 2048)+`"}`)
+		}
+		_, _ = w.Write([]byte(`{"data":{"info":{"id":"ses_root"},"messages":[` + strings.Join(messages, ",") + `]}}`))
+	}))
+	defer server.Close()
+	client := NewClient()
+	client.URL = server.URL
+	client.bodyLimit = 1024
+	export, err := client.Export(t.Context(), "ses_root")
+	require.NoError(t, err, "an export past the response bound still reads")
+	require.Len(t, export.Messages, 20)
+	require.Equal(t, "ses_root", export.Info.ID)
+	require.Equal(t, "msg_19", export.Messages[19].ID)
+	_, err = client.Export(t.Context(), "large")
+	require.ErrorContains(t, err, "message exceeds size limit")
 }
