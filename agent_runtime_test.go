@@ -163,40 +163,67 @@ func TestUnboundDescendantDialogsFailClosed(t *testing.T) {
 	}
 }
 
-func TestDeliverHoldsAFullQueueThenEndsTheBinding(t *testing.T) {
+func TestDeliverBuffersAFullQueueThenEndsTheBinding(t *testing.T) {
 	t.Parallel()
+	var interrupts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/interrupt") {
+			interrupts.Add(1)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := opencode.NewClient()
+	client.URL = server.URL
 	ctx := t.Context()
-	bindingCtx, cancel := context.WithCancel(ctx)
-	b := &binding{cancel: cancel, ending: bindingCtx.Done(), events: make(chan opencode.Event, 1)}
-	rt := &runtime{log: slog.New(slog.DiscardHandler), stallLimit: time.Hour}
-	event := opencode.Event{Type: "session.text.delta", SessionID: "ses_full"}
-	rt.deliver(ctx, b, event)
-	delivered := make(chan struct{})
-	go func() {
-		rt.deliver(ctx, b, event)
-		close(delivered)
-	}()
-	select {
-	case <-delivered:
-		t.Fatal("a full queue dropped or skipped an event instead of holding the stream")
-	case <-time.After(20 * time.Millisecond):
+	newBinding := func() *binding {
+		bindingCtx, cancel := context.WithCancel(ctx)
+
+		return &binding{cancel: cancel, ending: bindingCtx.Done(), events: make(chan opencode.Event, 1)}
 	}
-	<-b.events
-	select {
-	case <-delivered:
-	case <-time.After(testTimeout):
-		t.Fatal("a drained queue did not take the held event")
+	rt := &runtime{log: slog.New(slog.DiscardHandler), stallLimit: time.Hour, client: client}
+	event := func(id string) opencode.Event {
+		return opencode.Event{ID: id, Type: "session.text.delta", SessionID: "ses_full", Raw: []byte(`{}`)}
 	}
-	require.Len(t, b.events, 1)
+
+	b := newBinding()
+	for _, id := range []string{"evt_1", "evt_2", "evt_3"} {
+		rt.deliver(ctx, b, event(id))
+	}
+	for _, want := range []string{"evt_1", "evt_2", "evt_3"} {
+		select {
+		case got := <-b.events:
+			require.Equal(t, want, got.ID, "buffered events keep stream order")
+		case <-time.After(testTimeout):
+			t.Fatal("a buffered event never reached its binding")
+		}
+	}
+	require.Eventually(t, func() bool {
+		b.backlogMu.Lock()
+		defer b.backlogMu.Unlock()
+
+		return !b.forwarding
+	}, testTimeout, time.Millisecond)
 	require.NoError(t, b.endCause())
 
 	rt.stallLimit = 10 * time.Millisecond
-	rt.deliver(ctx, b, event)
+	rt.deliver(ctx, b, event("evt_4"))
+	rt.deliver(ctx, b, event("evt_5"))
+	rt.workers.Wait()
 	require.ErrorContains(t, b.endCause(), "opencode session event queue stayed full for 10ms")
+	require.EqualValues(t, 1, interrupts.Load(), "an ended binding interrupts its native execution")
 	select {
 	case <-b.ending:
 	default:
 		t.Fatal("an overflowing binding was not ended")
 	}
-	rt.deliver(ctx, b, event)
+
+	large := newBinding()
+	rt.deliver(ctx, large, event("evt_1"))
+	oversized := event("evt_2")
+	oversized.Raw = make([]byte, maxBacklogBytes+1)
+	rt.deliver(ctx, large, oversized)
+	rt.workers.Wait()
+	require.ErrorContains(t, large.endCause(), "backlog exceeded")
+	require.EqualValues(t, 2, interrupts.Load())
 }
