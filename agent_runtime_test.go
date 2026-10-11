@@ -246,3 +246,37 @@ func TestDeliverBuffersAFullQueueThenEndsTheBinding(t *testing.T) {
 	require.ErrorContains(t, large.endCause(), "backlog exceeded")
 	require.EqualValues(t, 2, interrupts.Load())
 }
+
+func TestStallLimitWaitsOutAPumpSettling(t *testing.T) {
+	t.Parallel()
+	var interrupts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/interrupt") {
+			interrupts.Add(1)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := opencode.NewClient()
+	client.URL = server.URL
+	ctx := t.Context()
+	bindingCtx, cancel := context.WithCancel(ctx)
+	b := &binding{cancel: cancel, ending: bindingCtx.Done(), events: make(chan opencode.Event, 1)}
+	rt := &runtime{log: slog.New(slog.DiscardHandler), stallLimit: 10 * time.Millisecond, client: client}
+	event := func(id string) opencode.Event {
+		return opencode.Event{ID: id, Type: "session.text.delta", SessionID: "ses_settling", Raw: []byte(`{}`)}
+	}
+	release := b.holdSettlement()
+	rt.deliver(ctx, b, event("evt_1"))
+	rt.deliver(ctx, b, event("evt_2"))
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, b.endCause(), "a pump waiting out a settlement keeps its binding")
+	require.Zero(t, interrupts.Load())
+	require.Equal(t, "evt_1", (<-b.events).ID)
+	require.Eventually(t, func() bool { return len(b.events) == 1 }, testTimeout, time.Millisecond)
+	rt.deliver(ctx, b, event("evt_3"))
+	release()
+	rt.workers.Wait()
+	require.ErrorContains(t, b.endCause(), "stayed full", "the stall limit runs again once the pump is free")
+	require.EqualValues(t, 1, interrupts.Load())
+}

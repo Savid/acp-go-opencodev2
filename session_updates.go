@@ -209,11 +209,17 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		s.beginSettlement(c)
 		t.settle(turnSettled)
 
+		release := rt.holdSettlement()
+		defer release()
+
 		select {
 		case <-t.finished:
 		case <-ctx.Done():
 		}
 	} else {
+		release := rt.holdSettlement()
+		defer release()
+
 		s.settleAgentCycle(ctx, rt, c)
 	}
 }

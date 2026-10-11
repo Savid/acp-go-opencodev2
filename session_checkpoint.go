@@ -3,9 +3,12 @@ package opencodeacp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"net/http"
 	"net/url"
 	"slices"
@@ -31,27 +34,35 @@ type nativeSnapshot struct {
 }
 
 // mirrorMark is where the mirrored graph continues: for each native session,
-// how many of its messages the store holds and the last one's identity.
+// how many of its messages the store holds and a digest of their bytes.
 type mirrorMark map[string]heldHistory
 
 type heldHistory struct {
-	count int
-	last  string
+	count  int
+	digest [sha256.Size]byte
 }
 
 // graphMark is the mark of a whole stored graph.
 func graphMark(graph []opencode.Export) mirrorMark {
 	mark := make(mirrorMark, len(graph))
 	for i := range graph {
-		held := heldHistory{count: len(graph[i].Messages)}
-		if held.count > 0 {
-			held.last = graph[i].Messages[held.count-1].ID
+		digest := sha256.New()
+		for _, message := range graph[i].Messages {
+			writeMessage(digest, message.Raw)
 		}
 
-		mark[graph[i].Info.ID] = held
+		mark[graph[i].Info.ID] = heldHistory{count: len(graph[i].Messages), digest: [sha256.Size]byte(digest.Sum(nil))}
 	}
 
 	return mark
+}
+
+// writeMessage adds one length-prefixed message to a history digest.
+func writeMessage(digest hash.Hash, raw []byte) {
+	var length [binary.MaxVarintLen64]byte
+
+	digest.Write(length[:binary.PutUvarint(length[:], uint64(len(raw)))])
+	digest.Write(raw)
 }
 
 // mirrorSource reads the native graph for one commit, leaving its latest read
@@ -145,14 +156,7 @@ func (s *session) readTail(ctx context.Context, rt *binding, terminal *opencode.
 			tail.rows = append(tail.rows, mirrorRow(id, read.fresh[i].Raw))
 		}
 
-		held := mark[id]
-		held.count += len(read.fresh)
-
-		if len(read.fresh) > 0 {
-			held.last = read.fresh[len(read.fresh)-1].ID
-		}
-
-		tail.mark[id] = held
+		tail.mark[id] = heldHistory{count: mark[id].count + len(read.fresh), digest: read.digest}
 		tail.infos = append(tail.infos, read.info)
 		ids = append(ids, id)
 
@@ -198,12 +202,15 @@ const (
 // past what the store holds, and its undelivered inbox inputs.
 type sessionTail struct {
 	info   json.RawMessage
+	digest [sha256.Size]byte
 	fresh  []opencode.Message
 	inputs []opencode.InboxInput
 }
 
 // readSessionTail streams one session's export past held. A held message is
-// read only for its identity. An input delivered as a message inside the cut
+// read only for its identity and digest; a held history whose bytes changed,
+// such as a message captured mid-execution and completed since, no longer
+// continues the mirror. An input delivered as a message inside the cut
 // leaves the inbox; one delivered past it stays pending.
 func readSessionTail(ctx context.Context, rt *binding, id string, held heldHistory, cut cutRule, terminal *opencode.Event) (sessionTail, error) {
 	// Read the inbox first so delivery cannot disappear between the two APIs.
@@ -215,8 +222,8 @@ func readSessionTail(ctx context.Context, rt *binding, id string, held heldHisto
 	var (
 		read      sessionTail
 		index     int
-		diverged  bool
 		marker    = -1
+		digest    = sha256.New()
 		delivered = map[string]int{}
 	)
 
@@ -272,7 +279,7 @@ func readSessionTail(ctx context.Context, rt *binding, id string, held heldHisto
 		}
 
 		if index < held.count {
-			diverged = diverged || index == held.count-1 && message.ID != held.last
+			writeMessage(digest, raw)
 		} else {
 			message.Raw = bytes.Clone(raw)
 			read.fresh = append(read.fresh, message)
@@ -294,7 +301,7 @@ func readSessionTail(ctx context.Context, rt *binding, id string, held heldHisto
 		return sessionTail{}, fmt.Errorf("native history of %s shrank from %d to %d messages", id, held.count, index)
 	}
 
-	if diverged {
+	if held.count > 0 && [sha256.Size]byte(digest.Sum(nil)) != held.digest {
 		return sessionTail{}, errRepublish
 	}
 
@@ -302,6 +309,11 @@ func readSessionTail(ctx context.Context, rt *binding, id string, held heldHisto
 		return sessionTail{}, err
 	}
 
+	for i := range read.fresh {
+		writeMessage(digest, read.fresh[i].Raw)
+	}
+
+	read.digest = [sha256.Size]byte(digest.Sum(nil))
 	end := held.count + len(read.fresh)
 
 	for _, input := range inbox {

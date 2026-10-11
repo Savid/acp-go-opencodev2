@@ -833,3 +833,56 @@ func TestFailedCommitKeepsTheSessionsNativeState(t *testing.T) {
 	record := storedRecord(t, store, created.SessionId)
 	require.Len(t, record.Sessions, 1)
 }
+
+func TestMirrorRepublishesAHeldMessageThatChanged(t *testing.T) {
+	t.Parallel()
+	store := &writeCountingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	rt := s.binding
+	native := *rt.client
+	target, err := url.Parse(native.URL)
+	require.NoError(t, err)
+	forward := httputil.NewSingleHostReverseProxy(target)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/export") {
+			forward.ServeHTTP(w, r)
+
+			return
+		}
+		exported, exportErr := native.Export(r.Context(), s.nativeID)
+		require.NoError(t, exportErr)
+		value := fakeExport{Info: exported.Info}
+		for _, message := range exported.Messages {
+			decoded, decodeErr := message.Decode()
+			require.NoError(t, decodeErr)
+			if decoded.Type == roleAssistant {
+				decoded.Text = "completed since its capture"
+			}
+			value.Messages = append(value.Messages, decoded)
+		}
+		fakeData(w, value)
+	}))
+	defer proxy.Close()
+	rt.client.URL = proxy.URL
+	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
+	rt.client.URL = native.URL
+	replaced, _, _ := store.writes()
+	require.Len(t, replaced, 2, "a held message whose bytes changed republishes the generation")
+	var record sessionRecord
+	rows, _, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	changed := false
+	for _, message := range storedMessages(t, rows, record, s.nativeID) {
+		changed = changed || strings.Contains(string(message.Raw), "completed since its capture")
+	}
+	require.True(t, changed, "the store holds the message as it is now")
+}

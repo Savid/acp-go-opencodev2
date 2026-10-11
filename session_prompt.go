@@ -291,6 +291,9 @@ func (s *session) finishCommand(ctx context.Context, t *turn) {
 	s.beginSettlement(&t.cycle)
 	t.settle(turnSettled)
 
+	release := t.binding.holdSettlement()
+	defer release()
+
 	select {
 	case <-t.finished:
 	case <-ctx.Done():

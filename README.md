@@ -109,12 +109,14 @@ first, the title, accepted options, captured local image bytes, and deferred
 synthetic inbox entries.
 
 A commit streams each session's export once and keeps only the messages past
-those the store holds, which it reads for their identity alone. The root ends at
+those the store holds, which it reads only to confirm their bytes are
+unchanged. The root ends at
 the execution's durable idle marker, named by its terminal event; each
 descendant ends at its latest idle marker, and its later messages follow in a
 later commit. The commit appends only the new rows and rewrites the
 configuration only when it changed. A message that settles before mirrored ones,
-or a mirrored session leaving the graph, republishes the generation. Restore
+a mirrored message whose bytes changed, or a mirrored session leaving the graph
+republishes the generation. Restore
 continues the stored generation without rewriting it. It is durable before terminal idle and
 the prompt response, including on cancellation. Native cumulative usage and
 session timestamps retain their values at capture time and may include later
@@ -134,7 +136,8 @@ store is in memory; supply a durable store to restore across adapter restarts.
 
 Native events reach each session in order. Events for a session that falls
 behind wait in its own backlog while other sessions continue. A session whose
-queue takes no event for 15 seconds, or whose backlog passes 16 MiB, ends its
+queue takes no event for 15 seconds while it is not settling a turn, or whose
+backlog of raw events passes 4 MiB, ends its
 binding: its native execution is interrupted and its turn fails naming that
 cause. A native
 protocol fault that ends a binding is logged and reported the same way.

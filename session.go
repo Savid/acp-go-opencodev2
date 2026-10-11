@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -94,6 +95,17 @@ type binding struct {
 	// overflowed marks a binding that outran its backlog; it takes no more
 	// events.
 	overflowed bool
+	// settling counts the pump's waits on a settlement, during which its
+	// queue's stall limit is paused.
+	settling atomic.Int32
+}
+
+// holdSettlement marks the pump as waiting out a settlement, which may take
+// as long as the commit it waits on; the returned function ends the wait.
+func (b *binding) holdSettlement() func() {
+	b.settling.Add(1)
+
+	return func() { b.settling.Add(-1) }
 }
 
 // dropBacklog marks b overflowed and releases its backlog. The caller holds
@@ -312,9 +324,14 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			s.beginSettlement(&t.cycle)
 			t.settle(end)
 
+			release := rt.holdSettlement()
+
 			select {
 			case <-t.finished:
+				release()
 			case <-ctx.Done():
+				release()
+
 				return
 			}
 

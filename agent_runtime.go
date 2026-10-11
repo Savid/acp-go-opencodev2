@@ -376,7 +376,7 @@ func (rt *runtime) deliver(ctx context.Context, b *binding, event opencode.Event
 
 // forward moves one binding's backlog into its queue in order while the
 // shared pump keeps serving other bindings. A queue that takes no event for
-// the stall limit ends the binding.
+// the stall limit while its pump is free to read ends the binding.
 func (rt *runtime) forward(ctx context.Context, b *binding, sessionID string) {
 	started := time.Now()
 	timer := time.NewTimer(rt.stallLimit)
@@ -406,31 +406,53 @@ func (rt *runtime) forward(ctx context.Context, b *binding, sessionID string) {
 		b.backlogBytes -= len(event.Raw)
 		b.backlogMu.Unlock()
 
-		timer.Reset(rt.stallLimit)
-
-		select {
-		case b.events <- event:
+		if rt.send(ctx, b, timer, event) {
 			continue
-		case <-b.ending:
-		case <-ctx.Done():
-		case <-timer.C:
-			b.backlogMu.Lock()
-			first := !b.overflowed
-			b.dropBacklog()
-			b.backlogMu.Unlock()
-
-			if first {
-				rt.overflow(ctx, b, sessionID, fmt.Errorf("opencode session event queue stayed full for %s", rt.stallLimit))
-			}
-
-			return
 		}
 
 		b.backlogMu.Lock()
+		first := !b.overflowed
 		b.dropBacklog()
 		b.backlogMu.Unlock()
 
+		if first && ctx.Err() == nil && b.endCause() == nil && !isClosed(b.ending) {
+			rt.overflow(ctx, b, sessionID, fmt.Errorf("opencode session event queue stayed full for %s", rt.stallLimit))
+		}
+
 		return
+	}
+}
+
+// send puts one event on the binding's queue and reports whether it went. The
+// stall limit runs only while the binding's pump is free to read: a pump
+// waiting out a settlement extends it.
+func (rt *runtime) send(ctx context.Context, b *binding, timer *time.Timer, event opencode.Event) bool {
+	timer.Reset(rt.stallLimit)
+
+	for {
+		select {
+		case b.events <- event:
+			return true
+		case <-b.ending:
+			return false
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			if b.settling.Load() == 0 {
+				return false
+			}
+
+			timer.Reset(rt.stallLimit)
+		}
+	}
+}
+
+func isClosed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
 	}
 }
 
