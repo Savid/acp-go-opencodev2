@@ -205,20 +205,20 @@ var errDialogCancelled = errors.New("dialog cancelled by the session")
 
 func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 
-	if rt != nil && rt.alive() {
-		return rt, nil
+	if b != nil && b.alive() {
+		return b, nil
 	}
 
-	rt, err := s.recoverRuntime(ctx)
+	b, err := s.recoverRuntime(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.openStream(ctx, rt); err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+	if err := s.openStream(ctx, b); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		if errors.Is(err, errSessionClosing) {
 			return nil, s.closingRefusal()
@@ -227,17 +227,17 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 		return nil, err
 	}
 
-	return rt, nil
+	return b, nil
 }
 
 func (s *session) recoverRuntime(ctx context.Context) (*binding, error) {
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	selection := OpenCodeOptions{Model: s.model, Mode: s.mode, Effort: s.effort}
 	s.mu.Unlock()
 
-	if rt != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+	if b != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 	}
 
 	var stored storedSession
@@ -257,44 +257,44 @@ func (s *session) recoverRuntime(ctx context.Context) (*binding, error) {
 		selection = OpenCodeOptions{Model: stored.record.Model, Mode: stored.record.Mode, Effort: stored.record.Effort}
 	}
 
-	rt, err := s.launch(ctx)
+	b, err := s.launch(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	if !s.ephemeral {
-		if _, err := s.hydrate(ctx, rt, stored); err != nil {
-			s.stopRuntime(context.WithoutCancel(ctx), rt)
+		if _, err := s.hydrate(ctx, b, stored); err != nil {
+			s.stopRuntime(context.WithoutCancel(ctx), b)
 
 			return nil, err
 		}
 	}
 
-	if err := s.configureRuntime(ctx, rt, selection, s.nativeID); err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+	if err := s.configureRuntime(ctx, b, selection, s.nativeID); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		return nil, err
 	}
 
-	return rt, nil
+	return b, nil
 }
 
 // pump serializes events and completed HTTP prompts for this binding.
-func (s *session) pump(ctx context.Context, rt *binding) {
-	defer close(rt.done)
-	defer s.runtimeEnded(ctx, rt)
+func (s *session) pump(ctx context.Context, b *binding) {
+	defer close(b.done)
+	defer s.runtimeEnded(ctx, b)
 
 	select {
-	case <-rt.bound:
+	case <-b.bound:
 	case <-ctx.Done():
 		return
 	}
 
 	for {
 		select {
-		case event := <-rt.events:
-			s.handleEvent(ctx, rt, event)
-		case result := <-rt.results:
+		case event := <-b.events:
+			s.handleEvent(ctx, b, event)
+		case result := <-b.results:
 			s.mu.Lock()
 			current := s.turn == result.turn
 			s.mu.Unlock()
@@ -314,7 +314,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 				continue
 			}
 
-			s.recordFailure(&t.cycle, s.dispatchFailure(ctx, rt, result.err))
+			s.recordFailure(&t.cycle, s.dispatchFailure(ctx, b, result.err))
 
 			end := turnSettled
 			if _, ok := errors.AsType[*opencode.HTTPError](result.err); !ok {
@@ -324,7 +324,7 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 			s.beginSettlement(&t.cycle)
 			t.settle(end)
 
-			release := rt.holdSettlement()
+			release := b.holdSettlement()
 
 			select {
 			case <-t.finished:
@@ -344,21 +344,21 @@ func (s *session) pump(ctx context.Context, rt *binding) {
 // runtimeEnded ends this generation: it runs the incarnation's lifecycle tail
 // first and drops the binding last, so an operation that relaunches waits on
 // this pump and opens an incarnation no earlier fence can reach.
-func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
-	rt.server.mu.Lock()
-	if rt.server.bindings[s.nativeID] == rt {
-		delete(rt.server.bindings, s.nativeID)
+func (s *session) runtimeEnded(ctx context.Context, b *binding) {
+	b.server.mu.Lock()
+	if b.server.bindings[s.nativeID] == b {
+		delete(b.server.bindings, s.nativeID)
 	}
-	rt.server.mu.Unlock()
+	b.server.mu.Unlock()
 	s.mu.Lock()
-	if s.binding != rt {
+	if s.binding != b {
 		s.mu.Unlock()
 
 		return
 	}
 
 	t, c, closing := s.turn, s.cycle, s.closing
-	if t != nil && t.binding != rt {
+	if t != nil && t.binding != b {
 		t = nil
 	}
 
@@ -370,7 +370,7 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	if t != nil {
 		t.cancelTurn()
 		t.settle(turnTransportEnded)
-		s.clearRuntime(rt)
+		s.clearRuntime(b)
 
 		return
 	}
@@ -390,27 +390,27 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 		s.fenceStream()
 	}
 
-	s.clearRuntime(rt)
+	s.clearRuntime(b)
 }
 
 // clearRuntime drops the binding once its generation's lifecycle tail has run.
-func (s *session) clearRuntime(rt *binding) {
+func (s *session) clearRuntime(b *binding) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.binding == rt {
+	if s.binding == b {
 		s.binding = nil
 	}
 }
 
-func (s *session) stopRuntime(_ context.Context, rt *binding) { rt.cancel(); <-rt.done }
+func (s *session) stopRuntime(_ context.Context, b *binding) { b.cancel(); <-b.done }
 
-// endBinding ends rt for a native protocol fault and logs why; a turn it
+// endBinding ends b for a native protocol fault and logs why; a turn it
 // interrupts reports the same cause.
-func (s *session) endBinding(ctx context.Context, rt *binding, cause error) {
+func (s *session) endBinding(ctx context.Context, b *binding, cause error) {
 	s.agent.log.ErrorContext(ctx, "opencode session binding ended",
 		slog.String("session_id", string(s.id)), slog.String("reason", cause.Error()))
-	rt.end(cause)
+	b.end(cause)
 }
 
 // rememberMessage stores the latest native info for one message.
@@ -435,11 +435,11 @@ func (s *session) nativeMessage(id string) opencode.NativeMessage {
 
 // abort interrupts the native run under a bounded context detached from the
 // caller's cancellation.
-func (s *session) abort(ctx context.Context, rt *binding) {
+func (s *session) abort(ctx context.Context, b *binding) {
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 	defer cancel()
 
-	if err := rt.client.Interrupt(abortCtx, s.nativeID); err != nil {
+	if err := b.client.Interrupt(abortCtx, s.nativeID); err != nil {
 		s.agent.log.DebugContext(abortCtx, "opencode abort failed", slog.String("session_id", string(s.id)))
 	}
 }
@@ -449,7 +449,7 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 func (s *session) cancel(ctx context.Context) {
 	s.mu.Lock()
 	t, c := s.turn, s.cycle
-	rt := s.binding
+	b := s.binding
 
 	if t != nil {
 		c = &t.cycle
@@ -463,7 +463,7 @@ func (s *session) cancel(ctx context.Context) {
 
 	c.cancelled = true
 
-	interrupt := !c.settling && rt != nil && !s.closing && rt.alive()
+	interrupt := !c.settling && b != nil && !s.closing && b.alive()
 	if interrupt {
 		s.callbacks.Add(1)
 	}
@@ -479,7 +479,7 @@ func (s *session) cancel(ctx context.Context) {
 		go func() {
 			defer s.callbacks.Done()
 
-			s.abort(ctx, rt)
+			s.abort(ctx, b)
 		}()
 	}
 }
@@ -636,7 +636,7 @@ func (s *session) close(ctx context.Context) error {
 	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
 
-	t, rt, closingCycle := s.turn, s.binding, s.cycle
+	t, b, closingCycle := s.turn, s.binding, s.cycle
 	if t != nil {
 		t.cancelled = true
 	}
@@ -650,8 +650,8 @@ func (s *session) close(ctx context.Context) error {
 	s.callbacks.Wait()
 
 	if t != nil {
-		if rt != nil {
-			s.abort(ctx, rt)
+		if b != nil {
+			s.abort(ctx, b)
 		}
 
 		select {
@@ -660,13 +660,13 @@ func (s *session) close(ctx context.Context) error {
 		}
 	}
 
-	if closingCycle != nil && rt != nil {
-		s.abort(ctx, rt)
+	if closingCycle != nil && b != nil {
+		s.abort(ctx, b)
 
 		select {
 		case <-closingCycle.done:
 		case <-time.After(sessionAbortTimeout):
-			s.stopRuntime(ctx, rt)
+			s.stopRuntime(ctx, b)
 		}
 	}
 
@@ -685,14 +685,14 @@ func (s *session) close(ctx context.Context) error {
 
 	var errs []error
 
-	if rt != nil {
+	if b != nil {
 		if persisted {
-			if err := s.commitMirror(commitCtx, rt, nil); err != nil {
+			if err := s.commitMirror(commitCtx, b, nil); err != nil {
 				errs = append(errs, err)
 			}
 		}
 
-		s.stopRuntime(commitCtx, rt)
+		s.stopRuntime(commitCtx, b)
 	}
 
 	// An open agent-origin cycle terminalizes as cancelled only after its owed

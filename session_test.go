@@ -333,9 +333,9 @@ func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
 	require.NoError(t, err)
 
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
-	require.NotNil(t, rt)
+	require.NotNil(t, b)
 
 	// A registered dialog holds the tail at callbacks.Wait, so the generation
 	// stays in the window the fence is about until the test releases it.
@@ -347,7 +347,7 @@ func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
 	require.True(t, registered)
 	t.Cleanup(release)
 
-	rt.cancel()
+	b.cancel()
 
 	select {
 	case <-entered:
@@ -356,10 +356,10 @@ func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	bound := s.binding == rt
+	bound := s.binding == b
 	s.mu.Unlock()
 	require.True(t, bound, "the tail runs before the binding is cleared")
-	require.False(t, rt.alive(), "a binding whose generation ended routes nothing")
+	require.False(t, b.alive(), "a binding whose generation ended routes nothing")
 
 	settled := make(chan error, 1)
 
@@ -529,7 +529,7 @@ func TestCloseJoinsFirstMirrorAndFencesOpening(t *testing.T) {
 			s, err := a.session(t.Context(), acp.SessionId(key.SessionID))
 			require.NoError(t, err)
 			s.mu.Lock()
-			rt := s.binding
+			b := s.binding
 			s.mu.Unlock()
 			closed := make(chan error, 1)
 			go func() {
@@ -567,7 +567,7 @@ func TestCloseJoinsFirstMirrorAndFencesOpening(t *testing.T) {
 			}
 			require.False(t, s.lc.Active())
 			before := len(rec.snapshot())
-			require.Error(t, s.openStream(t.Context(), rt))
+			require.Error(t, s.openStream(t.Context(), b))
 			require.Len(t, rec.snapshot(), before, "closed session published commands or a lifecycle snapshot")
 			require.False(t, s.lc.Active())
 		})
@@ -749,10 +749,10 @@ func TestBackgroundPublicationAllowsCancelCallback(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 	a.attach(&cancellingBackgroundClient{recorder: rec, agent: a}, nil)
-	s.openAgentCycle(t.Context(), rt)
+	s.openAgentCycle(t.Context(), b)
 	a.attach(rec, nil)
 	s.mu.Lock()
 	c := s.cycle
@@ -760,7 +760,7 @@ func TestBackgroundPublicationAllowsCancelCallback(t *testing.T) {
 	require.NotNil(t, c)
 	require.NoError(t, s.cycleFailure(c))
 	require.True(t, s.cycleCancelled(c))
-	s.settleAgentCycle(t.Context(), rt, c)
+	s.settleAgentCycle(t.Context(), b, c)
 }
 
 func TestCancelAgentOriginResolvesDialogsAndSettlesCancelled(t *testing.T) {
@@ -777,9 +777,9 @@ func TestCancelAgentOriginResolvesDialogsAndSettlesCancelled(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
-	s.openAgentCycle(t.Context(), rt)
+	s.openAgentCycle(t.Context(), b)
 	s.mu.Lock()
 	c := s.cycle
 	s.mu.Unlock()
@@ -803,7 +803,7 @@ func TestCancelAgentOriginResolvesDialogsAndSettlesCancelled(t *testing.T) {
 	prompt.Meta = promptMeta(1)
 	_, err = a.Prompt(t.Context(), prompt)
 	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
-	s.settleAgentCycle(t.Context(), rt, c)
+	s.settleAgentCycle(t.Context(), b, c)
 	s.mu.Lock()
 	active := s.cycle
 	s.mu.Unlock()
@@ -833,18 +833,18 @@ func TestTerminalPublicationCannotInterruptNextCycle(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 	terminalClient := &cancellingBackgroundClient{recorder: rec, agent: a, terminalOnly: true}
 	a.attach(terminalClient, nil)
-	s.openAgentCycle(t.Context(), rt)
+	s.openAgentCycle(t.Context(), b)
 	s.mu.Lock()
 	c := s.cycle
 	s.mu.Unlock()
 	require.NotNil(t, c)
 	require.NoError(t, s.cycleFailure(c))
 	require.False(t, s.cycleCancelled(c))
-	s.settleAgentCycle(t.Context(), rt, c)
+	s.settleAgentCycle(t.Context(), b, c)
 	require.False(t, s.cycleCancelled(c))
 	require.True(t, terminalClient.terminalCalled)
 	s.callbacks.Wait()
@@ -877,11 +877,11 @@ func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
 			require.NoError(t, err)
 
 			s.mu.Lock()
-			rt := s.binding
+			b := s.binding
 			s.mu.Unlock()
 
-			require.NoError(t, s.commitMirror(t.Context(), rt, nil), "a first mirror makes the session persisted")
-			s.openAgentCycle(t.Context(), rt)
+			require.NoError(t, s.commitMirror(t.Context(), b, nil), "a first mirror makes the session persisted")
+			s.openAgentCycle(t.Context(), b)
 			s.mu.Lock()
 			require.NotNil(t, s.cycle)
 			s.mu.Unlock()

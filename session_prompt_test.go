@@ -201,8 +201,8 @@ func TestNativeExecutionErrorPreservesProviderDetails(t *testing.T) {
 
 func TestCommandWithoutExecutionCompletes(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.binding
-	originalURL, _ := url.Parse(rt.client.URL)
+	b := s.binding
+	originalURL, _ := url.Parse(b.client.URL)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
 	accepted := make(chan struct{})
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +215,7 @@ func TestCommandWithoutExecutionCompletes(t *testing.T) {
 		forward.ServeHTTP(w, r)
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	done := make(chan error, 1)
 	go func() { _, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "/inspect")); done <- err }()
 	<-accepted
@@ -223,15 +223,15 @@ func TestCommandWithoutExecutionCompletes(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		rt.cancel()
+		b.cancel()
 		<-done
 		t.Fatal("native command returned 204 with no execution, but ACP prompt stayed pending")
 	}
 }
 func TestCancelBeforeNativeAcceptance(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.binding
-	originalURL, _ := url.Parse(rt.client.URL)
+	b := s.binding
+	originalURL, _ := url.Parse(b.client.URL)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -250,11 +250,11 @@ func TestCancelBeforeNativeAcceptance(t *testing.T) {
 		}
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = rt.client.Interrupt(ctx, s.nativeID)
+		_ = b.client.Interrupt(ctx, s.nativeID)
 	}()
 	done := make(chan acp.PromptResponse, 1)
 	failed := make(chan error, 1)
@@ -277,7 +277,7 @@ func TestCancelBeforeNativeAcceptance(t *testing.T) {
 	var active struct {
 		Data map[string]opencode.NativeSessionStatus `json:"data"`
 	}
-	require.NoError(t, rt.client.Do(t.Context(), "", http.MethodGet, "/api/session/active", nil, &active))
+	require.NoError(t, b.client.Do(t.Context(), "", http.MethodGet, "/api/session/active", nil, &active))
 	require.NotContains(t, active.Data, s.nativeID, "cancel reported success but native execution remained active")
 }
 
@@ -285,8 +285,8 @@ func TestCommandCompletionWaitsForStream(t *testing.T) {
 	a, s, _ := newDirectSession(t)
 	rec := newRecorder()
 	a.attach(rec, nil)
-	rt := s.binding
-	originalURL, err := url.Parse(rt.client.URL)
+	b := s.binding
+	originalURL, err := url.Parse(b.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
 	var submitted atomic.Bool
@@ -315,7 +315,7 @@ func TestCommandCompletionWaitsForStream(t *testing.T) {
 		forward.ServeHTTP(w, r)
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	done := make(chan error, 1)
 	go func() { _, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "/inspect")); done <- err }()
 	<-observed
@@ -329,13 +329,13 @@ func TestCommandCompletionWaitsForStream(t *testing.T) {
 		{Type: "session.text.ended", Created: 95, Data: json.RawMessage(`{"assistantMessageID":"msg_command","ordinal":0,"text":"command output"}`)},
 		{ID: "evt_command_end", Type: "session.execution.succeeded", Created: 100, SessionID: s.nativeID, Data: json.RawMessage(`{"sessionID":"` + s.nativeID + `"}`)},
 	} {
-		rt.events <- event
+		b.events <- event
 	}
 	select {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		rt.cancel()
+		b.cancel()
 		<-done
 		t.Fatal("command did not complete after its output stream")
 	}
@@ -365,8 +365,8 @@ func TestCommandControlBeforeExecution(t *testing.T) {
 			require.NoError(t, err)
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
-			rt := s.binding
-			target, err := url.Parse(rt.client.URL)
+			b := s.binding
+			target, err := url.Parse(b.client.URL)
 			require.NoError(t, err)
 			forward := httputil.NewSingleHostReverseProxy(target)
 			answered := make(chan struct{})
@@ -374,7 +374,7 @@ func TestCommandControlBeforeExecution(t *testing.T) {
 			replies := make(chan reply, 1)
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/command") {
-					rt.events <- opencode.Event{Type: tc.event, Data: json.RawMessage(tc.data)}
+					b.events <- opencode.Event{Type: tc.event, Data: json.RawMessage(tc.data)}
 					select {
 					case <-answered:
 						w.WriteHeader(http.StatusNoContent)
@@ -395,7 +395,7 @@ func TestCommandControlBeforeExecution(t *testing.T) {
 				forward.ServeHTTP(w, r)
 			}))
 			defer proxy.Close()
-			rt.client.URL = proxy.URL
+			b.client.URL = proxy.URL
 			prompt := wire.TextPromptRequest(s.id, "/inspect")
 			prompt.Meta = promptMeta(1)
 			response, err := a.Prompt(t.Context(), prompt)
@@ -438,8 +438,8 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	require.NoError(t, err)
 	s, err := a.session(ctx, created.SessionId)
 	require.NoError(t, err)
-	rt := s.binding
-	native := *rt.client
+	b := s.binding
+	native := *b.client
 	target, err := url.Parse(native.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
@@ -471,7 +471,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 		}
 	}))
 	t.Cleanup(proxy.Close)
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	t.Cleanup(func() {
 		cleanupCtx, stop := context.WithTimeout(context.Background(), time.Second)
 		defer stop()
@@ -525,7 +525,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	}
 	if mode == "store failure" {
 		require.Equal(t, "session mirror commit failed", requestErrorData(t, got.err)[wire.FieldMessage])
-		require.False(t, rt.alive())
+		require.False(t, b.alive())
 		require.NotContains(t, trace.snapshot(), "idle")
 		store.fail.Store(false)
 
@@ -537,7 +537,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 		expected = acp.StopReasonEndTurn
 	}
 	require.Equal(t, expected, got.response.StopReason)
-	require.True(t, rt.alive())
+	require.True(t, b.alive())
 	requireCommittedBeforeResponse(t, trace.snapshot())
 	var record sessionRecord
 	rows, found, err := sessionlog.Load(ctx, store, string(s.id), &record)
@@ -645,8 +645,8 @@ func requireCommittedBeforeResponse(t *testing.T, entries []string) {
 
 func TestShutdownInterruptEndsBindingWithoutSnapshot(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.binding
-	target, err := url.Parse(rt.client.URL)
+	b := s.binding
+	target, err := url.Parse(b.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
 	var snapshots atomic.Int32
@@ -657,11 +657,11 @@ func TestShutdownInterruptEndsBindingWithoutSnapshot(t *testing.T) {
 		forward.ServeHTTP(w, r)
 	}))
 	t.Cleanup(proxy.Close)
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "SHUTDOWN"))
 	data := requestErrorData(t, err)
 	require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
 	require.Equal(t, "opencode interrupted the execution for shutdown", data[wire.FieldMessage], "the turn names why its binding ended")
 	require.Zero(t, snapshots.Load())
-	require.False(t, rt.alive())
+	require.False(t, b.alive())
 }

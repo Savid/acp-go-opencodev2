@@ -151,7 +151,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 // response on a served connection, and runs it inline for an embedded host.
 func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 
 	if t := a.transportRef(); t != nil {
@@ -160,13 +160,13 @@ func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 			release := wire.HoldSessionGate(s.gate)
 			defer release()
 
-			err := s.openStream(hookCtx, rt)
+			err := s.openStream(hookCtx, b)
 			if err == nil || errors.Is(err, errSessionClosing) {
 				return
 			}
 
 			s.mu.Lock()
-			current := !s.closing && s.binding == rt
+			current := !s.closing && s.binding == b
 			s.mu.Unlock()
 
 			if current {
@@ -182,7 +182,7 @@ func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 		})
 	}
 
-	if err := s.openStream(ctx, rt); err != nil {
+	if err := s.openStream(ctx, b); err != nil {
 		if errors.Is(err, errSessionClosing) {
 			return s.closingRefusal()
 		}
@@ -226,7 +226,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 	s := a.newSession(start)
 
-	rt, err := s.launch(ctx)
+	b, err := s.launch(ctx)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -236,8 +236,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		selection.Model = a.options.DefaultModel
 	}
 
-	if err := s.configureRuntime(ctx, rt, selection, ""); err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+	if err := s.configureRuntime(ctx, b, selection, ""); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		return acp.NewSessionResponse{}, err
 	}
@@ -257,7 +257,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 	releaseSlot()
 
-	if err := s.commitMirror(ctx, rt, nil); err != nil {
+	if err := s.commitMirror(ctx, b, nil); err != nil {
 		a.log.ErrorContext(ctx, "initial mirror commit failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 		release()
@@ -388,15 +388,15 @@ func (a *Agent) restore(
 		}
 
 		active.mu.Lock()
-		rt := active.binding
+		b := active.binding
 		active.mu.Unlock()
 
 		if sameCarrier(active, start) {
 			return a.restoreActive(ctx, active, replay, release)
 		}
 
-		if rt != nil && !rt.alive() {
-			active.stopRuntime(context.WithoutCancel(ctx), rt)
+		if b != nil && !b.alive() {
+			active.stopRuntime(context.WithoutCancel(ctx), b)
 		}
 
 		release()
@@ -437,27 +437,27 @@ func (a *Agent) restore(
 	s.title = stored.record.Title
 	s.mirror = sessionlog.NewMirror(a.store, string(sessionID))
 
-	rt, err := s.launch(ctx)
+	b, err := s.launch(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	messages, err := s.hydrate(ctx, rt, stored)
+	messages, err := s.hydrate(ctx, b, stored)
 	if err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		return nil, nil, err
 	}
 
 	// The store holds this generation already; the first commit continues it.
 	if err := s.mirror.Adopt(stored.rows, stored.record, sessionlog.Position(graphMark(stored.graph))); err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
-	if err := s.configureRuntime(ctx, rt, s.options, s.nativeID); err != nil {
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+	if err := s.configureRuntime(ctx, b, s.options, s.nativeID); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 
 		return nil, nil, err
 	}
@@ -481,7 +481,7 @@ func (a *Agent) restore(
 
 	releaseSlot()
 
-	if err := s.commitMirror(ctx, rt, nil); err != nil {
+	if err := s.commitMirror(ctx, b, nil); err != nil {
 		release()
 
 		_ = s.close(context.WithoutCancel(ctx))
@@ -518,16 +518,16 @@ func (a *Agent) restore(
 // restoreActive keeps the session's foreground held through recovery and replay.
 func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, release func()) (*session, func(), error) {
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 
-	recovered := rt == nil || !rt.alive()
+	recovered := b == nil || !b.alive()
 
 	transferred := false
 	defer func() {
 		if !transferred {
-			if recovered && rt != nil {
-				s.stopRuntime(context.WithoutCancel(ctx), rt)
+			if recovered && b != nil {
+				s.stopRuntime(context.WithoutCancel(ctx), b)
 			}
 
 			release()
@@ -537,18 +537,18 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 	if recovered {
 		var err error
 
-		rt, err = s.recoverRuntime(ctx)
+		b, err = s.recoverRuntime(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	if err := s.commitMirror(ctx, rt, nil); err != nil {
+	if err := s.commitMirror(ctx, b, nil); err != nil {
 		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, s.id, err)
 	}
 
 	if replay {
-		messages, err := a.replayMessages(ctx, s, rt)
+		messages, err := a.replayMessages(ctx, s, b)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -571,9 +571,9 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 
 // replayMessages reads the root history a live session replays: the store's
 // copy, or the native one for an ephemeral session the store never holds.
-func (a *Agent) replayMessages(ctx context.Context, s *session, rt *binding) ([]opencode.Message, error) {
+func (a *Agent) replayMessages(ctx context.Context, s *session, b *binding) ([]opencode.Message, error) {
 	if s.ephemeral {
-		graph, err := s.readGraph(ctx, rt)
+		graph, err := s.readGraph(ctx, b)
 		if err != nil {
 			return nil, err
 		}

@@ -189,7 +189,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		return acp.PromptResponse{}, err
 	}
 
-	rt, err := s.ensureRuntime(turnCtx)
+	b, err := s.ensureRuntime(turnCtx)
 	if err != nil {
 		if turnCtx.Err() != nil {
 			return wire.CancelledResponse(params), nil
@@ -205,13 +205,13 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	}
 
 	s.mu.Lock()
-	if s.binding != rt || !rt.alive() {
+	if s.binding != b || !b.alive() {
 		s.mu.Unlock()
 
-		return acp.PromptResponse{}, s.transportFailure(context.WithoutCancel(ctx), rt, nil)
+		return acp.PromptResponse{}, s.transportFailure(context.WithoutCancel(ctx), b, nil)
 	}
 
-	t.binding = rt
+	t.binding = b
 	s.mu.Unlock()
 
 	requestCtx, requestCancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -219,7 +219,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 	path, body := s.promptRequest(mapped, t.messageID)
 	if path == nativeCommandPath {
-		native, err := rt.client.Session(turnCtx, s.nativeID)
+		native, err := b.client.Session(turnCtx, s.nativeID)
 		if err != nil {
 			requestCancel()
 
@@ -227,7 +227,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 				return wire.CancelledResponse(params), nil
 			}
 
-			return acp.PromptResponse{}, s.dispatchFailure(ctx, rt, err)
+			return acp.PromptResponse{}, s.dispatchFailure(ctx, b, err)
 		}
 
 		s.mu.Lock()
@@ -241,28 +241,28 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	go func() {
 		defer close(requestDone)
 
-		err := rt.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(s.nativeID)+path, body, nil)
+		err := b.client.Do(requestCtx, s.cwd, http.MethodPost, opencode.SessionPath(s.nativeID)+path, body, nil)
 		if s.repeatInterrupt(t) {
-			s.abort(ctx, rt)
+			s.abort(ctx, b)
 			s.callbacks.Done()
 		}
 
 		var idle int64
 
 		if err == nil && path == nativeCommandPath {
-			err = rt.client.Wait(requestCtx, s.nativeID)
+			err = b.client.Wait(requestCtx, s.nativeID)
 			if err == nil {
 				var native opencode.NativeSession
 
-				native, err = rt.client.Session(requestCtx, s.nativeID)
+				native, err = b.client.Session(requestCtx, s.nativeID)
 				idle = native.Time.Idle
 			}
 		}
 
 		select {
-		case rt.results <- nativePromptResult{turn: t, err: err, idle: idle}:
+		case b.results <- nativePromptResult{turn: t, err: err, idle: idle}:
 		case <-requestCtx.Done():
-		case <-rt.done:
+		case <-b.done:
 		}
 	}()
 
@@ -274,12 +274,12 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		select {
 		case <-t.settled:
 		case <-time.After(sessionAbortTimeout):
-			s.stopRuntime(context.WithoutCancel(ctx), rt)
+			s.stopRuntime(context.WithoutCancel(ctx), b)
 			t.settle(turnTransportEnded)
 		}
 	}
 
-	return s.settleTurn(ctx, rt, t, params)
+	return s.settleTurn(ctx, b, t, params)
 }
 
 // finishCommand settles a command that returned without starting execution.
@@ -303,27 +303,27 @@ func (s *session) finishCommand(ctx context.Context, t *turn) {
 // dispatchFailure classifies a prompt command opencode never accepted: a native
 // rejection carries its text as a provider failure, a dead child is a
 // process exit, and everything else is transport.
-func (s *session) dispatchFailure(ctx context.Context, rt *binding, err error) error {
+func (s *session) dispatchFailure(ctx context.Context, b *binding, err error) error {
 	if commandErr, ok := errors.AsType[*opencode.HTTPError](err); ok {
 		return wire.TurnFailed(vendor, nativeTurnFailure(&commandErr.Native))
 	}
 
-	return s.transportFailure(ctx, rt, err)
+	return s.transportFailure(ctx, b, err)
 }
 
 // transportFailure recovers the real cause behind a lost native stream: the
 // child's exit status and stderr tail where it died, otherwise the
 // transport error.
-func (s *session) transportFailure(ctx context.Context, rt *binding, err error) error {
+func (s *session) transportFailure(ctx context.Context, b *binding, err error) error {
 	if nativeErr, ok := errors.AsType[*opencode.HTTPError](err); ok {
 		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: nativeErr.Error(), StatusCode: nativeErr.Status})
 	}
 
 	if err == nil {
-		err = rt.endCause()
+		err = b.endCause()
 	}
 
-	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.server.proc, "opencode process", err, rt.server.stream.Err))
+	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, b.server.proc, "opencode process", err, b.server.stream.Err))
 }
 
 // cycleVerdict is how one cycle ended, in the terms the lifecycle stream and
@@ -367,7 +367,7 @@ func judgeCycle(c *cycle, failure error, cancelled bool) cycleVerdict {
 // settleTurn is the one settlement point every accepted prompt reaches:
 // session info, the durable mirror commit, the terminal idle, and only then
 // the response or error.
-func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
+func (s *session) settleTurn(ctx context.Context, b *binding, t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
 	s.beginSettlement(&t.cycle)
 
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
@@ -385,7 +385,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
 	case t.ended == turnTransportEnded:
-		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, b, nil)}
 	default:
 		verdict = judgeCycle(&t.cycle, s.cycleFailure(&t.cycle), false)
 	}
@@ -395,8 +395,8 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 
-		if err := s.commitMirror(settleCtx, rt, t.terminalEvent); err != nil {
-			s.stopRuntime(settleCtx, rt)
+		if err := s.commitMirror(settleCtx, b, t.terminalEvent); err != nil {
+			s.stopRuntime(settleCtx, b)
 			s.fenceStream()
 
 			commitFailed = true
@@ -422,7 +422,7 @@ func (s *session) settleTurn(ctx context.Context, rt *binding, t *turn, params a
 	// The incarnation ends with the generation that ran the turn, not with how
 	// the turn ended: a native exit after a settled turn must not leave the
 	// next process publishing on this stream.
-	if t.ended == turnTransportEnded || !s.boundTo(rt) {
+	if t.ended == turnTransportEnded || !s.boundTo(b) {
 		s.fenceStream()
 	}
 
@@ -452,12 +452,12 @@ func (s *session) mirrorFailure(state *cycleState, err error) error {
 	return wire.TurnFailed(vendor, failure)
 }
 
-// boundTo reports whether rt is still this session's live binding.
-func (s *session) boundTo(rt *binding) bool {
+// boundTo reports whether b is still this session's live binding.
+func (s *session) boundTo(b *binding) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.binding == rt && rt.alive()
+	return s.binding == b && b.alive()
 }
 
 func (s *session) promptRequest(mapped nativePrompt, id string) (string, any) {

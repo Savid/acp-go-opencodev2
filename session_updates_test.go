@@ -120,7 +120,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
 			s.mu.Lock()
-			rt := s.binding
+			b := s.binding
 			require.Nil(t, s.turn)
 			s.mu.Unlock()
 			data, err := os.ReadFile("testdata/native/agent-origin.json")
@@ -130,12 +130,12 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			require.NoError(t, json.Unmarshal(data, &frames))
 			terminal, err := opencode.DecodeEvent(frames[len(frames)-1])
 			require.NoError(t, err)
-			native, err := rt.client.Export(t.Context(), s.nativeID)
+			native, err := b.client.Export(t.Context(), s.nativeID)
 			require.NoError(t, err)
 			marker := opencode.NativeMessage{ID: strings.Replace(terminal.ID, "evt_", "msg_", 1), Type: "idle", Outcome: "succeeded"}
 			var fixtureActive atomic.Bool
 			fixtureActive.Store(true)
-			target, err := url.Parse(rt.client.URL)
+			target, err := url.Parse(b.client.URL)
 			require.NoError(t, err)
 			forward := httputil.NewSingleHostReverseProxy(target)
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,18 +147,18 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 				forward.ServeHTTP(w, r)
 			}))
 			t.Cleanup(proxy.Close)
-			rt.client.URL = proxy.URL
+			b.client.URL = proxy.URL
 			trace.reset()
 			store.fail.Store(failCommit)
 			for _, frame := range frames {
 				envelope, decodeErr := opencode.DecodeEvent(frame)
 				require.NoError(t, decodeErr)
-				rt.events <- envelope
+				b.events <- envelope
 			}
 			require.Eventually(t, func() bool {
 				if failCommit {
 					select {
-					case <-rt.done:
+					case <-b.done:
 						return true
 					default:
 						return false
@@ -206,7 +206,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 
 			// The fence is terminal, so the incarnation's binding ends with it.
 			select {
-			case <-rt.done:
+			case <-b.done:
 			case <-time.After(testTimeout):
 				t.Fatal("a failed agent-cycle commit left the binding in place")
 			}
@@ -449,16 +449,16 @@ func TestUsageCostAccumulatesFromNativeEvents(t *testing.T) {
 	a, s, _ := newDirectSession(t)
 	rec := newRecorder()
 	a.attach(rec, nil)
-	rt := s.binding
+	b := s.binding
 	s.mu.Lock()
 	s.cost = 1.5
 	s.mu.Unlock()
 	event := func(kind, data string) opencode.Event {
 		return opencode.Event{ID: opencode.NewID("evt_"), Type: kind, SessionID: s.nativeID, Data: json.RawMessage(data)}
 	}
-	s.handleEvent(t.Context(), rt, event(eventUsageRecorded, `{"source":"title","cost":0.25}`))
-	s.handleEvent(t.Context(), rt, event("session.step.ended", `{"assistantMessageID":"msg_other","cost":0.5}`))
-	s.handleEvent(t.Context(), rt, event("session.step.failed", `{"assistantMessageID":"msg_failed"}`))
+	s.handleEvent(t.Context(), b, event(eventUsageRecorded, `{"source":"title","cost":0.25}`))
+	s.handleEvent(t.Context(), b, event("session.step.ended", `{"assistantMessageID":"msg_other","cost":0.5}`))
+	s.handleEvent(t.Context(), b, event("session.step.failed", `{"assistantMessageID":"msg_failed"}`))
 	require.NoError(t, s.emitResponseUsage(t.Context(), &cycle{}, opencode.NativeMessage{ID: "msg_call", Tokens: fakeTokens(1, 0, 1)}))
 	reports := usageUpdates(rec.snapshot())
 	require.Len(t, reports, 1)

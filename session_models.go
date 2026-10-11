@@ -16,7 +16,7 @@ const configModel acp.SessionConfigId = "model"
 const configMode acp.SessionConfigId = "mode"
 const configEffort acp.SessionConfigId = "effort"
 
-func (s *session) resolveSelectionDefaults(ctx context.Context, rt *binding) error {
+func (s *session) resolveSelectionDefaults(ctx context.Context, b *binding) error {
 	s.mu.Lock()
 	model := s.model
 	s.mu.Unlock()
@@ -25,7 +25,7 @@ func (s *session) resolveSelectionDefaults(ctx context.Context, rt *binding) err
 		Data opencode.Model `json:"data"`
 	}
 	if model == "" {
-		if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/api/model/default", nil, &selected); err != nil {
+		if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/api/model/default", nil, &selected); err != nil {
 			return err
 		}
 	}
@@ -68,25 +68,25 @@ func (s *session) resolveSelectionDefaults(ctx context.Context, rt *binding) err
 
 // refreshCatalogs fetches the model, agent, and command catalogs this session
 // advertises.
-func (s *session) refreshCatalogs(ctx context.Context, rt *binding) error {
+func (s *session) refreshCatalogs(ctx context.Context, b *binding) error {
 	var models struct {
 		Data []opencode.Model `json:"data"`
 	}
-	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/api/model", nil, &models); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/api/model", nil, &models); err != nil {
 		return err
 	}
 
 	var agents struct {
 		Data []opencode.NativeAgent `json:"data"`
 	}
-	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/api/agent", nil, &agents); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/api/agent", nil, &agents); err != nil {
 		return err
 	}
 
 	var commands struct {
 		Data []opencode.NativeCommand `json:"data"`
 	}
-	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/api/command", nil, &commands); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/api/command", nil, &commands); err != nil {
 		return err
 	}
 
@@ -224,7 +224,7 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 		return nil, wire.Backpressure(limitSessionPrompt)
 	}
 
-	rt, err := s.ensureRuntime(ctx)
+	b, err := s.ensureRuntime(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -248,21 +248,21 @@ func (s *session) setConfigOption(ctx context.Context, id acp.SessionConfigId, v
 	}
 	s.mu.Unlock()
 
-	if err := s.applyConfigOption(ctx, rt, id); err != nil {
+	if err := s.applyConfigOption(ctx, b, id); err != nil {
 		s.mu.Lock()
 		s.model, s.mode, s.effort = oldModel, oldMode, oldEffort
 		s.mu.Unlock()
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 		s.fenceStream()
 
 		return nil, wire.InternalFailure(vendor, "")
 	}
 
-	if err := s.commitMirror(ctx, rt, nil); err != nil {
+	if err := s.commitMirror(ctx, b, nil); err != nil {
 		s.mu.Lock()
 		s.model, s.mode, s.effort = oldModel, oldMode, oldEffort
 		s.mu.Unlock()
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
+		s.stopRuntime(context.WithoutCancel(ctx), b)
 		s.fenceStream()
 
 		return nil, wire.InternalFailure(vendor, "")
@@ -298,28 +298,28 @@ func (s *session) emitCommands(ctx context.Context) error {
 	return s.emit(ctx, acp.SessionUpdate{AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: commands}})
 }
 
-func (s *session) applySelection(ctx context.Context, rt *binding) error {
-	if err := s.applyConfigOption(ctx, rt, configModel); err != nil {
+func (s *session) applySelection(ctx context.Context, b *binding) error {
+	if err := s.applyConfigOption(ctx, b, configModel); err != nil {
 		return err
 	}
 
-	return s.applyConfigOption(ctx, rt, configMode)
+	return s.applyConfigOption(ctx, b, configMode)
 }
 
-func (s *session) applyConfigOption(ctx context.Context, rt *binding, configID acp.SessionConfigId) error {
+func (s *session) applyConfigOption(ctx context.Context, b *binding, configID acp.SessionConfigId) error {
 	s.mu.Lock()
 	model, mode, effort := s.model, s.mode, s.effort
 	s.mu.Unlock()
 
 	if configID != configMode && model != "" {
 		provider, id, _ := strings.Cut(model, "/")
-		if err := rt.client.Do(ctx, "", http.MethodPost, opencode.SessionPath(s.nativeID)+"/model", map[string]any{"model": opencode.ModelRef{ID: id, ProviderID: provider, Variant: effort}}, nil); err != nil {
+		if err := b.client.Do(ctx, "", http.MethodPost, opencode.SessionPath(s.nativeID)+"/model", map[string]any{"model": opencode.ModelRef{ID: id, ProviderID: provider, Variant: effort}}, nil); err != nil {
 			return err
 		}
 	}
 
 	if configID == configMode && mode != "" {
-		return rt.client.Do(ctx, "", http.MethodPost, opencode.SessionPath(s.nativeID)+"/agent", map[string]any{"agent": mode}, nil)
+		return b.client.Do(ctx, "", http.MethodPost, opencode.SessionPath(s.nativeID)+"/agent", map[string]any{"agent": mode}, nil)
 	}
 
 	return nil

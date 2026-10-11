@@ -63,12 +63,12 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 	readCtx, cancel := context.WithTimeout(ctx, wire.AccountUsageReadTimeout)
 	defer cancel()
 
-	rt, err := s.ensureRuntime(readCtx)
+	b, err := s.ensureRuntime(readCtx)
 	if err != nil {
 		return wire.AccountUsageResponse{}, err
 	}
 
-	response, err = s.readProviderUsage(readCtx, rt, request.ProviderID, reader)
+	response, err = s.readProviderUsage(readCtx, b, request.ProviderID, reader)
 
 	if ctx.Err() != nil {
 		return wire.AccountUsageResponse{}, ctx.Err()
@@ -78,7 +78,7 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 		return wire.AccountUsageResponse{}, admission
 	}
 
-	if err != nil || !rt.alive() {
+	if err != nil || !b.alive() {
 		if err != nil {
 			a.log.ErrorContext(ctx, "opencode account usage read failed", slog.String("reason", err.Error()))
 		}
@@ -89,7 +89,7 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 	return response, nil
 }
 
-func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID string, reader usage.Reader) (wire.AccountUsageResponse, error) {
+func (s *session) readProviderUsage(ctx context.Context, b *binding, providerID string, reader usage.Reader) (wire.AccountUsageResponse, error) {
 	s.mu.Lock()
 	provider, model, _ := strings.Cut(s.model, "/")
 	selected := opencode.ModelRef{ProviderID: provider, ID: model, Variant: s.effort}
@@ -101,7 +101,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 		var err error
 
 		response, err = usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
-			return rt.client.UsageAccess(ctx, s.cwd, providerID, selected, func(key string) (string, bool) { return process.Lookup(rt.server.environment, key) })
+			return b.client.UsageAccess(ctx, s.cwd, providerID, selected, func(key string) (string, bool) { return process.Lookup(b.server.environment, key) })
 		}, reader)
 		if err != nil || response.Available {
 			return response, err
@@ -111,6 +111,6 @@ func (s *session) readProviderUsage(ctx context.Context, rt *binding, providerID
 	// A provider opencode holds no native account for may be brokered by a
 	// gateway the catalog routes to.
 	return gateway.ReadRoutes(ctx, s.agent.usageTransport, func(ctx context.Context) ([]gateway.Route, error) {
-		return rt.client.UsageGateways(ctx, s.cwd, selected, func(key string) (string, bool) { return process.Lookup(rt.server.environment, key) })
+		return b.client.UsageGateways(ctx, s.cwd, selected, func(key string) (string, bool) { return process.Lookup(b.server.environment, key) })
 	}, providerID, response)
 }

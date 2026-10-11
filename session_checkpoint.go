@@ -73,7 +73,7 @@ func writeMessage(digest hash.Hash, raw []byte) {
 // cursor it returns the whole graph. With a terminal event the root ends at
 // that execution's idle marker and each descendant at its latest one; without
 // one the whole graph must be idle around the read.
-func (s *session) mirrorSource(ctx context.Context, rt *binding, terminal *opencode.Event, last *graphTail) sessionlog.Source {
+func (s *session) mirrorSource(ctx context.Context, b *binding, terminal *opencode.Event, last *graphTail) sessionlog.Source {
 	return func(from sessionlog.Cursor) (sessionlog.Tail, error) {
 		mark, continues := from.Position().(mirrorMark)
 
@@ -83,7 +83,7 @@ func (s *session) mirrorSource(ctx context.Context, rt *binding, terminal *openc
 		)
 
 		for attempt := 1; ; attempt++ {
-			tail, err = s.readTail(ctx, rt, terminal, mark)
+			tail, err = s.readTail(ctx, b, terminal, mark)
 			if !errors.Is(err, opencode.ErrMarkerMissing) || attempt == markerAttempts {
 				break
 			}
@@ -116,9 +116,9 @@ type graphTail struct {
 	root   []opencode.Message
 }
 
-func (s *session) readTail(ctx context.Context, rt *binding, terminal *opencode.Event, mark mirrorMark) (graphTail, error) {
+func (s *session) readTail(ctx context.Context, b *binding, terminal *opencode.Event, mark mirrorMark) (graphTail, error) {
 	if terminal == nil {
-		if err := requireInactive(ctx, rt, []string{s.nativeID}); err != nil {
+		if err := requireInactive(ctx, b, []string{s.nativeID}); err != nil {
 			return graphTail{}, err
 		}
 	}
@@ -143,7 +143,7 @@ func (s *session) readTail(ctx context.Context, rt *binding, terminal *opencode.
 			cut = cutMarker
 		}
 
-		read, err := readSessionTail(ctx, rt, id, mark[id], cut, terminal)
+		read, err := readSessionTail(ctx, b, id, mark[id], cut, terminal)
 		if err != nil {
 			return graphTail{}, err
 		}
@@ -164,7 +164,7 @@ func (s *session) readTail(ctx context.Context, rt *binding, terminal *opencode.
 			tail.inputs[id] = read.inputs
 		}
 
-		children, err := childSessions(ctx, rt, id)
+		children, err := childSessions(ctx, b, id)
 		if err != nil {
 			return graphTail{}, err
 		}
@@ -179,7 +179,7 @@ func (s *session) readTail(ctx context.Context, rt *binding, terminal *opencode.
 	}
 
 	if terminal == nil {
-		if err := requireNativeIdle(ctx, rt, ids); err != nil {
+		if err := requireNativeIdle(ctx, b, ids); err != nil {
 			return graphTail{}, err
 		}
 	}
@@ -212,9 +212,9 @@ type sessionTail struct {
 // such as a message captured mid-execution and completed since, no longer
 // continues the mirror. An input delivered as a message inside the cut
 // leaves the inbox; one delivered past it stays pending.
-func readSessionTail(ctx context.Context, rt *binding, id string, held heldHistory, cut cutRule, terminal *opencode.Event) (sessionTail, error) {
+func readSessionTail(ctx context.Context, b *binding, id string, held heldHistory, cut cutRule, terminal *opencode.Event) (sessionTail, error) {
 	// Read the inbox first so delivery cannot disappear between the two APIs.
-	inbox, err := rt.client.Inbox(ctx, id)
+	inbox, err := b.client.Inbox(ctx, id)
 	if err != nil {
 		return sessionTail{}, err
 	}
@@ -243,7 +243,7 @@ func readSessionTail(ctx context.Context, rt *binding, id string, held heldHisto
 		inputs[input.ID] = input
 	}
 
-	err = rt.client.StreamExport(ctx, id, func(info json.RawMessage) error {
+	err = b.client.StreamExport(ctx, id, func(info json.RawMessage) error {
 		var native opencode.NativeSession
 		if decodeErr := json.Unmarshal(info, &native); decodeErr != nil {
 			return decodeErr
@@ -373,12 +373,12 @@ type storedRow struct {
 }
 
 // readGraph exports the whole idle native session graph, parent first.
-func (s *session) readGraph(ctx context.Context, rt *binding) ([]nativeSnapshot, error) {
-	if err := requireInactive(ctx, rt, []string{s.nativeID}); err != nil {
+func (s *session) readGraph(ctx context.Context, b *binding) ([]nativeSnapshot, error) {
+	if err := requireInactive(ctx, b, []string{s.nativeID}); err != nil {
 		return nil, err
 	}
 
-	graph, err := s.readExports(ctx, rt)
+	graph, err := s.readExports(ctx, b)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +400,7 @@ func (s *session) readGraph(ctx context.Context, rt *binding) ([]nativeSnapshot,
 		}
 	}
 
-	if err := requireNativeIdle(ctx, rt, ids); err != nil {
+	if err := requireNativeIdle(ctx, b, ids); err != nil {
 		return nil, err
 	}
 
@@ -412,7 +412,7 @@ func (s *session) readGraph(ctx context.Context, rt *binding) ([]nativeSnapshot,
 }
 
 // readExports reads the root and every descendant, parent first.
-func (s *session) readExports(ctx context.Context, rt *binding) ([]nativeSnapshot, error) {
+func (s *session) readExports(ctx context.Context, b *binding) ([]nativeSnapshot, error) {
 	var exports []nativeSnapshot
 
 	pending := []string{s.nativeID}
@@ -429,12 +429,12 @@ func (s *session) readExports(ctx context.Context, rt *binding) ([]nativeSnapsho
 		seen[id] = true
 
 		// Read the inbox first so delivery cannot disappear between the two APIs.
-		inbox, err := rt.client.Inbox(ctx, id)
+		inbox, err := b.client.Inbox(ctx, id)
 		if err != nil {
 			return nil, err
 		}
 
-		item, err := rt.client.Export(ctx, id)
+		item, err := b.client.Export(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -445,7 +445,7 @@ func (s *session) readExports(ctx context.Context, rt *binding) ([]nativeSnapsho
 
 		exports = append(exports, nativeSnapshot{Export: item, Inbox: inbox})
 
-		children, err := childSessions(ctx, rt, id)
+		children, err := childSessions(ctx, b, id)
 		if err != nil {
 			return nil, err
 		}
@@ -457,7 +457,7 @@ func (s *session) readExports(ctx context.Context, rt *binding) ([]nativeSnapsho
 }
 
 // childSessions lists a session's direct children in creation order.
-func childSessions(ctx context.Context, rt *binding, id string) ([]string, error) {
+func childSessions(ctx context.Context, b *binding, id string) ([]string, error) {
 	var (
 		ids    []string
 		cursor string
@@ -476,7 +476,7 @@ func childSessions(ctx context.Context, rt *binding, id string) ([]string, error
 			path += "&cursor=" + url.QueryEscape(cursor)
 		}
 
-		if err := rt.client.Do(ctx, "", http.MethodGet, path, nil, &children); err != nil {
+		if err := b.client.Do(ctx, "", http.MethodGet, path, nil, &children); err != nil {
 			return nil, err
 		}
 
@@ -496,11 +496,11 @@ func childSessions(ctx context.Context, rt *binding, id string) ([]string, error
 	}
 }
 
-func requireInactive(ctx context.Context, rt *binding, ids []string) error {
+func requireInactive(ctx context.Context, b *binding, ids []string) error {
 	var active struct {
 		Data map[string]opencode.NativeSessionStatus `json:"data"`
 	}
-	if err := rt.client.Do(ctx, "", http.MethodGet, "/api/session/active", nil, &active); err != nil {
+	if err := b.client.Do(ctx, "", http.MethodGet, "/api/session/active", nil, &active); err != nil {
 		return err
 	}
 
@@ -513,8 +513,8 @@ func requireInactive(ctx context.Context, rt *binding, ids []string) error {
 	return nil
 }
 
-func requireNativeIdle(ctx context.Context, rt *binding, ids []string) error {
-	if err := requireInactive(ctx, rt, ids); err != nil {
+func requireNativeIdle(ctx context.Context, b *binding, ids []string) error {
+	if err := requireInactive(ctx, b, ids); err != nil {
 		return err
 	}
 
@@ -523,7 +523,7 @@ func requireNativeIdle(ctx context.Context, rt *binding, ids []string) error {
 			var pending struct {
 				Data []json.RawMessage `json:"data"`
 			}
-			if err := rt.client.Do(ctx, "", http.MethodGet, opencode.SessionPath(id)+suffix, nil, &pending); err != nil {
+			if err := b.client.Do(ctx, "", http.MethodGet, opencode.SessionPath(id)+suffix, nil, &pending); err != nil {
 				return err
 			}
 

@@ -36,34 +36,34 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
-	var child = createNativeChild(t, rt, s.nativeID, cwd)
+	var child = createNativeChild(t, b, s.nativeID, cwd)
 
 	promptCtx, stop := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		request := map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}
-		done <- rt.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", request, nil)
+		done <- b.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", request, nil)
 	}()
 	require.Eventually(t, func() bool {
 		var statuses struct {
 			Data map[string]opencode.NativeSessionStatus `json:"data"`
 		}
-		if rt.client.Do(t.Context(), cwd, http.MethodGet, "/api/session/active", nil, &statuses) != nil {
+		if b.client.Do(t.Context(), cwd, http.MethodGet, "/api/session/active", nil, &statuses) != nil {
 			return false
 		}
 
 		return statuses.Data[child.ID].Type == "running"
 	}, 5*time.Second, 10*time.Millisecond)
 
-	require.ErrorContains(t, s.commitMirror(t.Context(), rt, nil), "native session is still running")
+	require.ErrorContains(t, s.commitMirror(t.Context(), b, nil), "native session is still running")
 
-	require.NoError(t, rt.client.Interrupt(t.Context(), child.ID))
-	require.NoError(t, rt.client.Wait(t.Context(), child.ID))
+	require.NoError(t, b.client.Interrupt(t.Context(), child.ID))
+	require.NoError(t, b.client.Wait(t.Context(), child.ID))
 	stop()
 	<-done
-	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
+	require.NoError(t, s.commitMirror(t.Context(), b, nil))
 	var record sessionRecord
 	rows, found, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
 	require.NoError(t, err)
@@ -92,19 +92,19 @@ func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	s, err := a.session(t.Context(), root.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
 	parent := s.nativeID
 	want := make([]string, 1, 3)
 	want[0] = parent
 	for range 2 {
-		var child = createNativeChild(t, rt, parent, cwd)
+		var child = createNativeChild(t, b, parent, cwd)
 		want = append(want, child.ID)
 		parent = child.ID
 	}
 	unrelated, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
-	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
+	require.NoError(t, s.commitMirror(t.Context(), b, nil))
 	var record sessionRecord
 	rows, found, err := sessionlog.Load(t.Context(), store, string(root.SessionId), &record)
 	require.NoError(t, err)
@@ -502,14 +502,14 @@ func TestEphemeralSessionMetaIsRefusedWhereItHasNoMeaning(t *testing.T) {
 	require.Equal(t, "_meta."+wire.SessionMetaKey+".persist", requestErrorData(t, err)[wire.FieldField])
 }
 
-func createNativeChild(t *testing.T, rt *binding, parent, cwd string) opencode.NativeSession {
+func createNativeChild(t *testing.T, b *binding, parent, cwd string) opencode.NativeSession {
 	t.Helper()
-	info, err := rt.client.Session(t.Context(), parent)
+	info, err := b.client.Session(t.Context(), parent)
 	require.NoError(t, err)
 	info.ID = opencode.NewID("ses_")
 	info.ParentID = parent
 	body := map[string]any{"info": info, "messages": []any{}}
-	require.NoError(t, rt.client.Do(t.Context(), "", http.MethodPost, "/api/experimental/session/import", body, nil))
+	require.NoError(t, b.client.Do(t.Context(), "", http.MethodPost, "/api/experimental/session/import", body, nil))
 
 	return info
 }
@@ -702,21 +702,21 @@ func TestMirrorContinuesDescendantHistory(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.binding
+	b := s.binding
 	s.mu.Unlock()
-	child := createNativeChild(t, rt, s.nativeID, cwd)
+	child := createNativeChild(t, b, s.nativeID, cwd)
 	promptCtx, stop := context.WithCancel(t.Context())
 	defer stop()
 	running := make(chan error, 1)
 	go func() {
-		running <- rt.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}, nil)
+		running <- b.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}, nil)
 	}()
 	require.Eventually(t, func() bool {
 		var statuses struct {
 			Data map[string]opencode.NativeSessionStatus `json:"data"`
 		}
 
-		return rt.client.Do(t.Context(), cwd, http.MethodGet, "/api/session/active", nil, &statuses) == nil && statuses.Data[child.ID].Type == "running"
+		return b.client.Do(t.Context(), cwd, http.MethodGet, "/api/session/active", nil, &statuses) == nil && statuses.Data[child.ID].Type == "running"
 	}, testTimeout, 10*time.Millisecond)
 
 	stored := func() map[string][]opencode.Message {
@@ -737,8 +737,8 @@ func TestMirrorContinuesDescendantHistory(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, stored()[child.ID], "a running descendant commits nothing past its latest completed execution")
 
-	require.NoError(t, rt.client.Interrupt(t.Context(), child.ID))
-	require.NoError(t, rt.client.Wait(t.Context(), child.ID))
+	require.NoError(t, b.client.Interrupt(t.Context(), child.ID))
+	require.NoError(t, b.client.Wait(t.Context(), child.ID))
 	stop()
 	<-running
 	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
@@ -746,7 +746,7 @@ func TestMirrorContinuesDescendantHistory(t *testing.T) {
 	messages := stored()
 	require.NotEmpty(t, messages[child.ID], "the descendant's finished execution follows in the next commit")
 	require.Equal(t, "idle", messages[child.ID][len(messages[child.ID])-1].Type)
-	native, err := rt.client.Export(t.Context(), child.ID)
+	native, err := b.client.Export(t.Context(), child.ID)
 	require.NoError(t, err)
 	require.Len(t, messages[child.ID], len(native.Messages), "no descendant message is skipped")
 	replaced, _, _ := store.writes()
@@ -766,8 +766,8 @@ func TestMirrorRepublishesALateSettledMessage(t *testing.T) {
 	require.NoError(t, err)
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
-	rt := s.binding
-	native := *rt.client
+	b := s.binding
+	native := *b.client
 	target, err := url.Parse(native.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
@@ -792,9 +792,9 @@ func TestMirrorRepublishesALateSettledMessage(t *testing.T) {
 		fakeData(w, value)
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
-	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
-	rt.client.URL = native.URL
+	b.client.URL = proxy.URL
+	require.NoError(t, s.commitMirror(t.Context(), b, nil))
+	b.client.URL = native.URL
 	replaced, _, _ := store.writes()
 	require.Len(t, replaced, 2, "a message settling before mirrored ones republishes the generation")
 	var record sessionRecord
@@ -847,8 +847,8 @@ func TestMirrorRepublishesAHeldMessageThatChanged(t *testing.T) {
 	require.NoError(t, err)
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
-	rt := s.binding
-	native := *rt.client
+	b := s.binding
+	native := *b.client
 	target, err := url.Parse(native.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
@@ -872,9 +872,9 @@ func TestMirrorRepublishesAHeldMessageThatChanged(t *testing.T) {
 		fakeData(w, value)
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
-	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
-	rt.client.URL = native.URL
+	b.client.URL = proxy.URL
+	require.NoError(t, s.commitMirror(t.Context(), b, nil))
+	b.client.URL = native.URL
 	replaced, _, _ := store.writes()
 	require.Len(t, replaced, 2, "a held message whose bytes changed republishes the generation")
 	var record sessionRecord

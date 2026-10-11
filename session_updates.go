@@ -113,9 +113,9 @@ func isTurnAcceptance(t *turn, eventType, inboxID string) bool {
 	}
 }
 
-func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.Event) {
+func (s *session) handleEvent(ctx context.Context, b *binding, event opencode.Event) {
 	s.mu.Lock()
-	t, c, closing, current := s.turn, s.cycle, s.closing, s.binding == rt
+	t, c, closing, current := s.turn, s.cycle, s.closing, s.binding == b
 	s.mu.Unlock()
 
 	if !current || closing && t == nil && c == nil {
@@ -132,12 +132,12 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 	var data eventData
 	if err := json.Unmarshal(event.Data, &data); err != nil {
-		s.endBinding(ctx, rt, fmt.Errorf("opencode sent an unreadable %s event: %w", event.Type, err))
+		s.endBinding(ctx, b, fmt.Errorf("opencode sent an unreadable %s event: %w", event.Type, err))
 
 		return
 	}
 
-	if s.observeSession(ctx, rt, event, data) {
+	if s.observeSession(ctx, b, event, data) {
 		return
 	}
 
@@ -165,7 +165,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 
 		c = &t.cycle
 	} else if c == nil && event.Type == eventExecutionStarted {
-		c = s.openAgentCycle(ctx, rt)
+		c = s.openAgentCycle(ctx, b)
 	}
 
 	if c == nil {
@@ -175,7 +175,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	c.state.init()
 
 	if control {
-		s.handleControl(ctx, rt, c, event)
+		s.handleControl(ctx, b, c, event)
 
 		return
 	}
@@ -209,7 +209,7 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		s.beginSettlement(c)
 		t.settle(turnSettled)
 
-		release := rt.holdSettlement()
+		release := b.holdSettlement()
 		defer release()
 
 		select {
@@ -217,26 +217,26 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		case <-ctx.Done():
 		}
 	} else {
-		release := rt.holdSettlement()
+		release := b.holdSettlement()
 		defer release()
 
-		s.settleAgentCycle(ctx, rt, c)
+		s.settleAgentCycle(ctx, b, c)
 	}
 }
 
 // observeSession applies the events that concern the session rather than a
 // foreground cycle and reports whether the event is fully handled.
-func (s *session) observeSession(ctx context.Context, rt *binding, event opencode.Event, data eventData) bool {
+func (s *session) observeSession(ctx context.Context, b *binding, event opencode.Event, data eventData) bool {
 	switch event.Type {
 	case eventExecutionInterrupted:
 		if data.Reason == "shutdown" {
-			s.endBinding(ctx, rt, errors.New("opencode interrupted the execution for shutdown"))
+			s.endBinding(ctx, b, errors.New("opencode interrupted the execution for shutdown"))
 
 			return true
 		}
 	case "session.deleted":
 		s.poisonSession(ctx, wire.CauseNativeSessionIdentityDrift)
-		s.endBinding(ctx, rt, errors.New("opencode deleted the native session"))
+		s.endBinding(ctx, b, errors.New("opencode deleted the native session"))
 
 		return true
 	case eventStepEnded, eventStepFailed:
@@ -497,10 +497,10 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, id, name stri
 	return s.emit(ctx, acp.UpdateToolCall(toolID, acp.WithUpdateStatus(status), acp.WithUpdateRawInput(native.Input), acp.WithUpdateContent(content)))
 }
 
-func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
+func (s *session) openAgentCycle(ctx context.Context, b *binding) *cycle {
 	c := &cycle{Cycle: s.lc.NewAgentCycle(), done: make(chan struct{})}
 	s.mu.Lock()
-	if s.turn != nil || s.cycle != nil || s.closing || s.binding != rt {
+	if s.turn != nil || s.cycle != nil || s.closing || s.binding != b {
 		s.mu.Unlock()
 
 		return nil
@@ -512,7 +512,7 @@ func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.binding != rt || s.cycle != c || s.closing {
+	if s.binding != b || s.cycle != c || s.closing {
 		return nil
 	}
 
@@ -612,7 +612,7 @@ func (s *session) sessionInfo() acp.SessionInfo {
 	return info
 }
 
-func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
+func (s *session) settleAgentCycle(ctx context.Context, b *binding, c *cycle) {
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
@@ -622,13 +622,13 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 		c.state.stopReason = statusComplete
 	}
 
-	if err := s.commitMirror(settleCtx, rt, c.terminalEvent); err != nil {
+	if err := s.commitMirror(settleCtx, b, c.terminalEvent); err != nil {
 		s.recordFailure(c, s.mirrorFailure(&c.state, err))
 		s.fenceStream()
 		// A fenced incarnation is terminal, so the binding ends with it and the
 		// next operation relaunches and opens a new one. This runs on the
 		// binding's own pump, which joins itself, so the cancel is the drop.
-		rt.end(errors.New("session mirror commit failed"))
+		b.end(errors.New("session mirror commit failed"))
 	}
 
 	verdict := judgeCycle(c, s.cycleFailure(c), s.claimCancellation(c))

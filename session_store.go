@@ -114,17 +114,17 @@ func validNativeSessionID(id string) bool {
 // A history that no longer continues the mirror is republished whole. An
 // ephemeral session commits nothing: opencode's own database holds it until
 // the host deletes it.
-func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *opencode.Event) error {
+func (s *session) commitMirror(ctx context.Context, b *binding, terminal *opencode.Event) error {
 	if s.ephemeral {
 		return nil
 	}
 
-	if rt == nil {
+	if b == nil {
 		return errors.New("session has no native binding")
 	}
 
 	if terminal == nil {
-		if err := rt.client.Wait(ctx, s.nativeID); err != nil {
+		if err := b.client.Wait(ctx, s.nativeID); err != nil {
 			return err
 		}
 	}
@@ -133,7 +133,7 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 
 	var last graphTail
 
-	source := s.mirrorSource(ctx, rt, terminal, &last)
+	source := s.mirrorSource(ctx, b, terminal, &last)
 	record := func(sessionlog.Tail) (any, error) {
 		value := s.record()
 		value.Sessions = last.infos
@@ -277,7 +277,7 @@ func decodeStored(rows [][]byte, record sessionRecord) ([]opencode.Export, error
 // hydrate imports absent conversations and adopts a longer native transcript,
 // returning the root's verified messages. The native API cannot replace an
 // existing shorter transcript, so that case fails closed.
-func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([]opencode.Message, error) {
+func (s *session) hydrate(ctx context.Context, b *binding, stored storedSession) ([]opencode.Message, error) {
 	s.mu.Lock()
 	s.artifacts = cloneArtifacts(stored.record.Artifacts)
 	s.mu.Unlock()
@@ -287,7 +287,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 	for i := range want {
 		saved := &want[i]
 
-		current, readErr := rt.client.Export(ctx, saved.Info.ID)
+		current, readErr := b.client.Export(ctx, saved.Info.ID)
 		switch {
 		case opencode.IsMissing(readErr):
 			location := saved.Info.Location
@@ -295,17 +295,17 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 				location.Directory = s.cwd
 			}
 
-			if importErr := rt.client.Import(ctx, *saved, location); importErr != nil {
+			if importErr := b.client.Import(ctx, *saved, location); importErr != nil {
 				return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, importErr)
 			}
 
 			for _, input := range stored.record.PendingInputs[saved.Info.ID] {
-				if enqueueErr := rt.client.Enqueue(ctx, input); enqueueErr != nil {
+				if enqueueErr := b.client.Enqueue(ctx, input); enqueueErr != nil {
 					return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, enqueueErr)
 				}
 			}
 
-			if pendingErr := reconcileImportedInputs(ctx, rt, saved.Info.ID, stored.record.PendingInputs[saved.Info.ID]); pendingErr != nil {
+			if pendingErr := reconcileImportedInputs(ctx, b, saved.Info.ID, stored.record.PendingInputs[saved.Info.ID]); pendingErr != nil {
 				return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, pendingErr)
 			}
 		case readErr != nil:
@@ -317,7 +317,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 		}
 	}
 
-	verified, err := s.readGraph(ctx, rt)
+	verified, err := s.readGraph(ctx, b)
 	if err != nil {
 		return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 	}
@@ -459,12 +459,12 @@ func verifyPendingInputs(saved, current []opencode.InboxInput, messages []openco
 
 // Import publishes native creation events; plugins may enqueue reminders already
 // present in the saved inbox. Retain the saved identities for those reminders.
-func reconcileImportedInputs(ctx context.Context, rt *binding, sessionID string, saved []opencode.InboxInput) error {
+func reconcileImportedInputs(ctx context.Context, b *binding, sessionID string, saved []opencode.InboxInput) error {
 	if len(saved) == 0 {
 		return nil
 	}
 
-	current, err := rt.client.Inbox(ctx, sessionID)
+	current, err := b.client.Inbox(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -481,7 +481,7 @@ func reconcileImportedInputs(ctx context.Context, rt *binding, sessionID string,
 
 		for _, original := range saved {
 			if input.Delivery == original.Delivery && sameJSON(input.Payload, original.Payload) {
-				if err := rt.client.CancelInput(ctx, sessionID, input.ID); err != nil {
+				if err := b.client.CancelInput(ctx, sessionID, input.ID); err != nil {
 					return err
 				}
 

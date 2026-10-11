@@ -25,7 +25,7 @@ func (s *session) closingRefusal() error {
 	return wire.UnknownSession()
 }
 
-func (s *session) openStream(ctx context.Context, rt *binding) error {
+func (s *session) openStream(ctx context.Context, b *binding) error {
 	s.openMu.Lock()
 	defer s.openMu.Unlock()
 
@@ -37,7 +37,7 @@ func (s *session) openStream(ctx context.Context, rt *binding) error {
 		return errSessionClosing
 	}
 
-	if rt == nil || s.binding != rt || !rt.alive() {
+	if b == nil || s.binding != b || !b.alive() {
 		s.mu.Unlock()
 
 		return wire.RuntimeUnavailable(vendor)
@@ -53,7 +53,7 @@ func (s *session) openStream(ctx context.Context, rt *binding) error {
 		return err
 	}
 
-	rt.bindOnce.Do(func() { close(rt.bound) })
+	b.bindOnce.Do(func() { close(b.bound) })
 
 	return nil
 }

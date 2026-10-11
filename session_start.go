@@ -23,13 +23,13 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 	}
 
 	readCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	rt := &binding{server: server, client: server.client, cancel: cancel, ending: readCtx.Done(), bound: make(chan struct{}), done: make(chan struct{}), events: make(chan opencode.Event, 256), results: make(chan nativePromptResult, 1)}
+	b := &binding{server: server, client: server.client, cancel: cancel, ending: readCtx.Done(), bound: make(chan struct{}), done: make(chan struct{}), events: make(chan opencode.Event, 256), results: make(chan nativePromptResult, 1)}
 
 	s.mu.Lock()
 	closing := s.closing
 
 	if !closing {
-		s.binding = rt
+		s.binding = b
 	}
 	s.mu.Unlock()
 
@@ -41,9 +41,9 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 		return nil, wire.UnknownSession()
 	}
 
-	go s.pump(readCtx, rt)
+	go s.pump(readCtx, b)
 
-	return rt, nil
+	return b, nil
 }
 
 func (s *session) startFailure(ctx context.Context, err error) error {
@@ -52,7 +52,7 @@ func (s *session) startFailure(ctx context.Context, err error) error {
 	return wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
-func (s *session) configureRuntime(ctx context.Context, rt *binding, selection OpenCodeOptions, expectID string) error {
+func (s *session) configureRuntime(ctx context.Context, b *binding, selection OpenCodeOptions, expectID string) error {
 	ctx, cancel := context.WithTimeout(ctx, serverStartupTimeout)
 	defer cancel()
 
@@ -72,7 +72,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 		var created struct {
 			Data opencode.NativeSession `json:"data"`
 		}
-		if err := rt.client.Do(ctx, "", http.MethodPost, "/api/session", body, &created); err != nil {
+		if err := b.client.Do(ctx, "", http.MethodPost, "/api/session", body, &created); err != nil {
 			return s.startFailure(ctx, err)
 		}
 
@@ -86,7 +86,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 	} else {
 		var err error
 
-		native, err = rt.client.Session(ctx, expectID)
+		native, err = b.client.Session(ctx, expectID)
 		if err != nil {
 			return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
@@ -98,12 +98,12 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 
 	var err error
 
-	native, err = s.configureLocation(ctx, rt, native)
+	native, err = s.configureLocation(ctx, b, native)
 	if err != nil {
 		return err
 	}
 
-	if err := rt.client.Do(ctx, s.cwd, http.MethodPatch, opencode.SessionPath(native.ID), map[string]any{"metadata": s.carrierMetadata(native.Metadata), "permissions": s.permissionRules()}, nil); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodPatch, opencode.SessionPath(native.ID), map[string]any{"metadata": s.carrierMetadata(native.Metadata), "permissions": s.permissionRules()}, nil); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
@@ -129,42 +129,42 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 	s.updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
-	if err := rt.client.WaitForPlugins(ctx, s.cwd); err != nil {
+	if err := b.client.WaitForPlugins(ctx, s.cwd); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
-	if err := s.refreshCatalogs(ctx, rt); err != nil {
+	if err := s.refreshCatalogs(ctx, b); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
-	if err := s.configureEnvironment(ctx, rt); err != nil {
+	if err := s.configureEnvironment(ctx, b); err != nil {
 		return err
 	}
 
-	if err := opencode.CheckPlugin(rt.server.root, s.cwd); err != nil {
+	if err := opencode.CheckPlugin(b.server.root, s.cwd); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
-	if err := s.resolveSelectionDefaults(ctx, rt); err != nil {
+	if err := s.resolveSelectionDefaults(ctx, b); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
-	if err := s.applySelection(ctx, rt); err != nil {
+	if err := s.applySelection(ctx, b); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
-	rt.server.mu.Lock()
-	defer rt.server.mu.Unlock()
+	b.server.mu.Lock()
+	defer b.server.mu.Unlock()
 
-	if existing := rt.server.bindings[native.ID]; existing != nil && existing != rt {
+	if existing := b.server.bindings[native.ID]; existing != nil && existing != b {
 		return wire.Backpressure(limitSessionRestore)
 	}
 
-	if !rt.server.alive() {
+	if !b.server.alive() {
 		return wire.RuntimeUnavailable(vendor)
 	}
 
-	rt.server.bindings[native.ID] = rt
+	b.server.bindings[native.ID] = b
 
 	return nil
 }
@@ -194,7 +194,7 @@ func (s *session) permissionRules() []map[string]string {
 	return []map[string]string{{"action": "*", "resource": "*", "effect": permission}}
 }
 
-func (s *session) configureEnvironment(ctx context.Context, rt *binding) error {
+func (s *session) configureEnvironment(ctx context.Context, b *binding) error {
 	merged := s.agent.environment(s.options.Env, nil)
 	merged.ExtraPathDirs = s.options.ExtraPathDirs
 
@@ -211,28 +211,28 @@ func (s *session) configureEnvironment(ctx context.Context, rt *binding) error {
 	}
 
 	for _, key := range []string{"OPENCODE_SERVER_PASSWORD", "OPENCODE_CONFIG_CONTENT", "OPENCODE_SERVER_USERNAME"} {
-		if value, ok := process.Lookup(rt.server.environment, key); ok {
+		if value, ok := process.Lookup(b.server.environment, key); ok {
 			variables[key] = value
 		}
 	}
 
-	if err := rt.client.Do(ctx, "", http.MethodPut, opencode.SessionPath(s.nativeID)+"/environment", map[string]any{"variables": variables}, nil); err != nil {
+	if err := b.client.Do(ctx, "", http.MethodPut, opencode.SessionPath(s.nativeID)+"/environment", map[string]any{"variables": variables}, nil); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
 	// The carrier may have changed, so descendants read it again.
-	if err := opencode.AdvancePluginGeneration(rt.server.root); err != nil {
+	if err := opencode.AdvancePluginGeneration(b.server.root); err != nil {
 		return s.startFailure(ctx, err)
 	}
 
 	return nil
 }
 
-func (s *session) configureLocation(ctx context.Context, rt *binding, native opencode.NativeSession) (opencode.NativeSession, error) {
+func (s *session) configureLocation(ctx context.Context, b *binding, native opencode.NativeSession) (opencode.NativeSession, error) {
 	var statuses struct {
 		Data map[string]opencode.NativeSessionStatus `json:"data"`
 	}
-	if err := rt.client.Do(ctx, s.cwd, http.MethodGet, "/api/session/active", nil, &statuses); err != nil {
+	if err := b.client.Do(ctx, s.cwd, http.MethodGet, "/api/session/active", nil, &statuses); err != nil {
 		return opencode.NativeSession{}, s.startFailure(ctx, err)
 	}
 
@@ -241,7 +241,7 @@ func (s *session) configureLocation(ctx context.Context, rt *binding, native ope
 	}
 
 	if native.Location.Directory != s.cwd {
-		inbox, err := rt.client.Inbox(ctx, native.ID)
+		inbox, err := b.client.Inbox(ctx, native.ID)
 		if err != nil {
 			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
@@ -250,11 +250,11 @@ func (s *session) configureLocation(ctx context.Context, rt *binding, native ope
 			return opencode.NativeSession{}, wire.Backpressure(limitSessionRestore)
 		}
 
-		if err = rt.client.Move(ctx, native.ID, s.cwd); err != nil {
+		if err = b.client.Move(ctx, native.ID, s.cwd); err != nil {
 			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 
-		native, err = rt.client.Session(ctx, native.ID)
+		native, err = b.client.Session(ctx, native.ID)
 		if err != nil {
 			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}

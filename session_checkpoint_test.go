@@ -25,8 +25,8 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 			response, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "HELLO"))
 			require.NoError(t, err)
 			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
-			rt := s.binding
-			native := *rt.client
+			b := s.binding
+			native := *b.client
 			exported, err := native.Export(t.Context(), s.nativeID)
 			require.NoError(t, err)
 			var record sessionRecord
@@ -36,7 +36,7 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 			require.Equal(t, "idle", marker.Type)
 			terminal := opencode.Event{ID: strings.Replace(marker.ID, "msg_", "evt_", 1), Type: "session.execution.succeeded", SessionID: s.nativeID}
 			if mode == "active child" {
-				child := createNativeChild(t, rt, s.nativeID, s.cwd)
+				child := createNativeChild(t, b, s.nativeID, s.cwd)
 				require.NoError(t, native.Do(t.Context(), s.cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}, nil))
 				defer func() { _ = native.Interrupt(t.Context(), child.ID) }()
 			}
@@ -45,7 +45,7 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 			forward := httputil.NewSingleHostReverseProxy(target)
 			childID := ""
 			if mode == "changing child" || mode == "completed child" {
-				child := createNativeChild(t, rt, s.nativeID, s.cwd)
+				child := createNativeChild(t, b, s.nativeID, s.cwd)
 				childID = child.ID
 			}
 			var reads atomic.Int32
@@ -79,13 +79,13 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 				fakeData(w, json.RawMessage(checkpointExport(mode, count, exported)))
 			}))
 			defer proxy.Close()
-			rt.client.URL = proxy.URL
+			b.client.URL = proxy.URL
 			if mode != "held marker" {
 				// Read the whole history again, as the first commit of a mirror does.
 				s.mirror.Reset()
 			}
-			err = s.commitMirror(t.Context(), rt, &terminal)
-			rt.client.URL = native.URL
+			err = s.commitMirror(t.Context(), b, &terminal)
+			b.client.URL = native.URL
 			rows, _, loadErr := sessionlog.Load(t.Context(), a.store, string(s.id), &record)
 			require.NoError(t, loadErr)
 			if mode == "missing marker" || mode == "wrong outcome" || mode == "export failure" {
@@ -206,7 +206,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 			b.Cleanup(func() { _ = a.Close() })
 			s := &session{agent: a, id: "ses_bench", nativeID: "ses_bench", cwd: "/work"}
 			s.mirror = sessionlog.NewMirror(a.store, "ses_bench")
-			rt := &binding{client: client}
+			bound := &binding{client: client}
 			publish := func() {
 				encoded, err := json.Marshal(map[string]any{"data": fakeExport{Info: opencode.NativeSession{ID: "ses_bench"}, Messages: messages}})
 				require.NoError(b, err)
@@ -215,7 +215,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 			publish()
 			var last graphTail
 			record := func(sessionlog.Tail) (any, error) { return s.record(), nil }
-			require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil, &last), record))
+			require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), bound, nil, &last), record))
 			for b.Loop() {
 				b.StopTimer()
 				messages = append(messages, benchMessage(len(messages), text), benchMessage(len(messages)+1, text))
@@ -224,7 +224,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 					s.mirror.Reset()
 				}
 				b.StartTimer()
-				require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil, &last), record))
+				require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), bound, nil, &last), record))
 			}
 		})
 	}

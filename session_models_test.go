@@ -115,8 +115,8 @@ func TestSetConfigOptionAppliesAndRefuses(t *testing.T) {
 
 func TestConfigChangeUsesOnlyAddressedSelector(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.binding
-	target, err := url.Parse(rt.client.URL)
+	b := s.binding
+	target, err := url.Parse(b.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
 	var modelCalls, agentCalls atomic.Int32
@@ -132,7 +132,7 @@ func TestConfigChangeUsesOnlyAddressedSelector(t *testing.T) {
 		forward.ServeHTTP(w, r)
 	}))
 	defer proxy.Close()
-	rt.client.URL = proxy.URL
+	b.client.URL = proxy.URL
 	_, err = a.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(s.id, configModel, "fake/text"))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, modelCalls.Load())
@@ -153,9 +153,9 @@ func TestFailedNativeConfigChangeRebindsCommittedSelection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, s, _ := newDirectSession(t)
-			rt := s.binding
+			b := s.binding
 			before := s.record()
-			target, err := url.Parse(rt.client.URL)
+			target, err := url.Parse(b.client.URL)
 			require.NoError(t, err)
 			forward := httputil.NewSingleHostReverseProxy(target)
 			var fail atomic.Bool
@@ -169,10 +169,10 @@ func TestFailedNativeConfigChangeRebindsCommittedSelection(t *testing.T) {
 			}
 			proxy := httptest.NewServer(forward)
 			defer proxy.Close()
-			rt.client.URL = proxy.URL
+			b.client.URL = proxy.URL
 			_, err = a.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(s.id, tc.id, acp.SessionConfigValueId(tc.value)))
 			require.Equal(t, "opencode_internal_failure", requestErrorData(t, err)["error"])
-			require.False(t, rt.alive())
+			require.False(t, b.alive())
 			require.Equal(t, before.Model, s.record().Model)
 			require.Equal(t, before.Mode, s.record().Mode)
 			require.Equal(t, before.Effort, s.record().Effort)
@@ -231,9 +231,9 @@ func TestNativeDefaultsAndChangedSelectionSurviveRebind(t *testing.T) {
 	require.NoError(t, err)
 	s.stopRuntime(t.Context(), s.binding)
 	s.fenceStream()
-	rt, err := s.ensureRuntime(t.Context())
+	b, err := s.ensureRuntime(t.Context())
 	require.NoError(t, err)
-	native, err = rt.client.Session(t.Context(), s.nativeID)
+	native, err = b.client.Session(t.Context(), s.nativeID)
 	require.NoError(t, err)
 	require.Equal(t, "high", native.Model.Variant)
 	require.Equal(t, "build", native.Agent)

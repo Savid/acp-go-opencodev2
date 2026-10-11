@@ -374,11 +374,11 @@ func TestRestoreRefusesPoisonedSession(t *testing.T) {
 			t.Run(operation+"/"+state, func(t *testing.T) {
 				t.Parallel()
 				a, s, cwd := newDirectSession(t)
-				rt := s.binding
+				b := s.binding
 				s.poisonSession(t.Context(), wire.CauseNativeSessionIdentityDrift)
 				if state == "ended" {
-					rt.cancel()
-					<-rt.done
+					b.cancel()
+					<-b.done
 				}
 				if state == "changed carrier" {
 					cwd = t.TempDir()

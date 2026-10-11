@@ -18,7 +18,7 @@ import (
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
 
-func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, event opencode.Event) {
+func (s *session) handleControl(ctx context.Context, b *binding, c *cycle, event opencode.Event) {
 	var (
 		permission opencode.PermissionRequest
 		formEvent  struct {
@@ -30,7 +30,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 
 	if event.Type == eventPermissionAsked {
 		if json.Unmarshal(event.Data, &permission) != nil {
-			s.endBinding(ctx, rt, errors.New("opencode sent an unreadable permission request"))
+			s.endBinding(ctx, b, errors.New("opencode sent an unreadable permission request"))
 
 			return
 		}
@@ -38,7 +38,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 		id = permission.ID
 	} else {
 		if json.Unmarshal(event.Data, &formEvent) != nil {
-			s.endBinding(ctx, rt, errors.New("opencode sent an unreadable form"))
+			s.endBinding(ctx, b, errors.New("opencode sent an unreadable form"))
 
 			return
 		}
@@ -47,7 +47,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 	}
 
 	if id == "" {
-		s.endBinding(ctx, rt, errors.New("opencode sent a dialog without an identity"))
+		s.endBinding(ctx, b, errors.New("opencode sent a dialog without an identity"))
 
 		return
 	}
@@ -96,8 +96,8 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 		replyCtx, replyCancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 		defer replyCancel()
 
-		if err := rt.client.Do(replyCtx, "", method, path, body, nil); err != nil && !opencode.IsMissing(err) {
-			s.endBinding(ctx, rt, fmt.Errorf("opencode dialog reply failed: %w", err))
+		if err := b.client.Do(replyCtx, "", method, path, body, nil); err != nil && !opencode.IsMissing(err) {
+			s.endBinding(ctx, b, fmt.Errorf("opencode dialog reply failed: %w", err))
 		}
 	}()
 }
