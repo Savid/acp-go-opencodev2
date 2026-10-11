@@ -46,10 +46,7 @@ export default {
         }
         id = data.parentID
       }
-      if (!carrier) {
-        applied.add(sessionID)
-        return
-      }
+      if (!carrier) return
       if (!carrier.env || !Array.isArray(carrier.extraPathDirs)) throw Error("session environment missing")
       const variables = { ...process.env }
       for (const [key, value] of Object.entries(carrier.env)) {
