@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -193,6 +194,120 @@ func (c *Client) Export(ctx context.Context, id string) (Export, error) {
 
 	return out.Data, err
 }
+
+// StreamExport reads one session export as it arrives: info receives the
+// session information, then message receives each settled message's raw bytes
+// in native order. A message's bytes are valid only during its call, so the
+// export is never held whole.
+func (c *Client) StreamExport(ctx context.Context, id string, info func(json.RawMessage) error, message func(raw []byte) error) error {
+	response, err := c.request(ctx, "", http.MethodGet, "/api/experimental/session/"+url.PathEscape(id)+"/export", nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, MaxBodyBytes))
+		e := &HTTPError{Status: response.StatusCode}
+
+		_ = json.Unmarshal(data, &e.Native)
+		if e.Native.Status == 0 {
+			e.Native.Status = response.StatusCode
+		}
+
+		return e
+	}
+
+	if !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
+		return &ProtocolError{Message: "OpenCode v2 JSON API required"}
+	}
+
+	decoder := jsontext.NewDecoder(response.Body)
+
+	return readObject(decoder, func(key string) error {
+		if key != "data" {
+			return decoder.SkipValue()
+		}
+
+		return readObject(decoder, func(key string) error {
+			switch key {
+			case "info":
+				value, err := decoder.ReadValue()
+				if err != nil {
+					return err
+				}
+
+				return info(append(json.RawMessage(nil), value...))
+			case "messages":
+				return readArray(decoder, func() error {
+					value, err := decoder.ReadValue()
+					if err != nil {
+						return err
+					}
+
+					if len(value) > MaxBodyBytes {
+						return errors.New("opencode message exceeds size limit")
+					}
+
+					return message(value)
+				})
+			default:
+				return decoder.SkipValue()
+			}
+		})
+	})
+}
+
+// readObject calls member for each key of the next JSON object; member reads
+// or skips that key's value.
+func readObject(decoder *jsontext.Decoder, member func(key string) error) error {
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return err
+	}
+
+	if token.Kind() != '{' {
+		return &ProtocolError{Message: "opencode export is not an object"}
+	}
+
+	for decoder.PeekKind() != '}' {
+		key, keyErr := decoder.ReadToken()
+		if keyErr != nil {
+			return keyErr
+		}
+
+		if memberErr := member(key.String()); memberErr != nil {
+			return memberErr
+		}
+	}
+
+	_, err = decoder.ReadToken()
+
+	return err
+}
+
+// readArray calls element for each element of the next JSON array.
+func readArray(decoder *jsontext.Decoder, element func() error) error {
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return err
+	}
+
+	if token.Kind() != '[' {
+		return &ProtocolError{Message: "opencode export messages are not an array"}
+	}
+
+	for decoder.PeekKind() != ']' {
+		if elementErr := element(); elementErr != nil {
+			return elementErr
+		}
+	}
+
+	_, err = decoder.ReadToken()
+
+	return err
+}
+
 func (c *Client) Import(ctx context.Context, snapshot Export, location Location) error {
 	messages := snapshot.Messages
 	if messages == nil {

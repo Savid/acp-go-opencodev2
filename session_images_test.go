@@ -200,7 +200,7 @@ func TestLocalImagesSurviveFullHistoryRestore(t *testing.T) {
 		Messages: []opencode.NativeMessage{{ID: "msg_images", Type: roleAssistant, Content: content}},
 	})
 	s.captureImages(graph[0].Messages)
-	require.NoError(t, sessionlog.NewMirror(store, string(s.id)).Commit(t.Context(), sessionlog.Rows(graphRows(graph)), s.record()))
+	require.NoError(t, sessionlog.NewMirror(store, string(s.id)).Commit(t.Context(), sessionlog.Rows(storedRows(graph)), recordOf(s.record())))
 	require.NoError(t, os.Remove(path))
 	h := newHarness(t, WithSessionStore(store))
 	h.initialize()

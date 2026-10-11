@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -180,7 +184,7 @@ func TestRestoreRefusesMissingImageArtifact(t *testing.T) {
 	uncaptured := record
 	uncaptured.Artifacts = nil
 
-	require.NoError(t, sessionlog.NewMirror(store, string(session.SessionId)).Commit(t.Context(), sessionlog.Rows(stored), uncaptured))
+	require.NoError(t, sessionlog.NewMirror(store, string(session.SessionId)).Commit(t.Context(), sessionlog.Rows(stored), recordOf(uncaptured)))
 
 	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
@@ -253,7 +257,7 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), record))
+	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), recordOf(record)))
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -535,7 +539,7 @@ func TestRestoreVerifiesPromotedPendingInput(t *testing.T) {
 	}
 	require.NoError(t, verifyPendingInputs([]opencode.InboxInput{input}, []opencode.InboxInput{input}, nil))
 	require.Error(t, verifyPendingInputs([]opencode.InboxInput{input}, nil, nil))
-	record := sessionRecord{SessionID: "ses_native", NativeSessionID: "ses_native", Cwd: t.TempDir(), UpdatedAtUnixMilli: 1, Sessions: []json.RawMessage{json.RawMessage(`{"id":"ses_native"}`)}, PendingInputs: map[string][]opencode.InboxInput{"ses_native": {input, input}}}
+	record := sessionRecord{SessionID: "ses_native", NativeSessionID: "ses_native", Cwd: t.TempDir(), Sessions: []json.RawMessage{json.RawMessage(`{"id":"ses_native"}`)}, PendingInputs: map[string][]opencode.InboxInput{"ses_native": {input, input}}}
 	require.ErrorContains(t, record.validate("ses_native"), "duplicate native pending input")
 }
 
@@ -679,44 +683,123 @@ func TestMirrorAppendsOnlyNewRows(t *testing.T) {
 	_, err = h.prompt(created.SessionId, "HELLO", nil)
 	require.NoError(t, err)
 	replaced, appended, _ = store.writes()
-	require.Len(t, replaced, 2, "a restored session republishes once")
+	require.Equal(t, []int{0}, replaced, "a restored session continues its stored generation")
 	require.Positive(t, appended[len(appended)-1])
 }
 
-func TestGraphRowsExtendCommittedRows(t *testing.T) {
+func TestMirrorContinuesDescendantHistory(t *testing.T) {
 	t.Parallel()
-	message := func(id string, created int64) opencode.NativeMessage {
-		value := opencode.NativeMessage{ID: id, Type: roleUser}
-		value.Time.Created = created
-
-		return value
-	}
-	s := &session{}
-	root := opencode.NativeSession{ID: "ses_root"}
-	child := opencode.NativeSession{ID: "ses_child", ParentID: "ses_root"}
-	first := graphRows(storedGraph(t, s,
-		fakeExport{Info: root, Messages: []opencode.NativeMessage{message("msg_a", 1), message("msg_c", 3)}},
-		fakeExport{Info: child, Messages: []opencode.NativeMessage{message("msg_b", 2)}},
-	))
-	later := graphRows(storedGraph(t, s,
-		fakeExport{Info: root, Messages: []opencode.NativeMessage{message("msg_a", 1), message("msg_c", 3), message("msg_e", 5)}},
-		fakeExport{Info: child, Messages: []opencode.NativeMessage{message("msg_b", 2), message("msg_d", 4)}},
-	))
-	require.Len(t, first, 6)
-	require.Equal(t, first, later[:len(first)], "a longer graph extends the committed rows")
-	record := sessionRecord{NativeSessionID: "ses_root", Sessions: s.nativeInfos}
-	graph, err := decodeStored(later, record)
+	store := &writeCountingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
-	ids := func(messages []opencode.Message) []string {
-		out := make([]string, 0, len(messages))
-		for _, m := range messages {
-			out = append(out, m.ID)
+	cwd := t.TempDir()
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.binding
+	s.mu.Unlock()
+	child := createNativeChild(t, rt, s.nativeID, cwd)
+	promptCtx, stop := context.WithCancel(t.Context())
+	defer stop()
+	running := make(chan error, 1)
+	go func() {
+		running <- rt.client.Do(promptCtx, cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}, nil)
+	}()
+	require.Eventually(t, func() bool {
+		var statuses struct {
+			Data map[string]opencode.NativeSessionStatus `json:"data"`
 		}
 
-		return out
+		return rt.client.Do(t.Context(), cwd, http.MethodGet, "/api/session/active", nil, &statuses) == nil && statuses.Data[child.ID].Type == "running"
+	}, testTimeout, 10*time.Millisecond)
+
+	stored := func() map[string][]opencode.Message {
+		var record sessionRecord
+		rows, found, loadErr := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+		require.NoError(t, loadErr)
+		require.True(t, found)
+		graph, decodeErr := decodeStored(rows, record)
+		require.NoError(t, decodeErr)
+		messages := map[string][]opencode.Message{}
+		for i := range graph {
+			messages[graph[i].Info.ID] = graph[i].Messages
+		}
+
+		return messages
 	}
-	require.Equal(t, []string{"msg_a", "msg_c", "msg_e"}, ids(graph[0].Messages))
-	require.Equal(t, []string{"msg_b", "msg_d"}, ids(graph[1].Messages))
-	_, err = decodeStored(later[1:], record)
-	require.Error(t, err, "a message row needs its session row")
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	require.Empty(t, stored()[child.ID], "a running descendant commits nothing past its latest completed execution")
+
+	require.NoError(t, rt.client.Interrupt(t.Context(), child.ID))
+	require.NoError(t, rt.client.Wait(t.Context(), child.ID))
+	stop()
+	<-running
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	messages := stored()
+	require.NotEmpty(t, messages[child.ID], "the descendant's finished execution follows in the next commit")
+	require.Equal(t, "idle", messages[child.ID][len(messages[child.ID])-1].Type)
+	native, err := rt.client.Export(t.Context(), child.ID)
+	require.NoError(t, err)
+	require.Len(t, messages[child.ID], len(native.Messages), "no descendant message is skipped")
+	replaced, _, _ := store.writes()
+	require.Equal(t, []int{0}, replaced, "descendant history appends without republishing")
+}
+
+func TestMirrorRepublishesALateSettledMessage(t *testing.T) {
+	t.Parallel()
+	store := &writeCountingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	rt := s.binding
+	native := *rt.client
+	target, err := url.Parse(native.URL)
+	require.NoError(t, err)
+	forward := httputil.NewSingleHostReverseProxy(target)
+	late := opencode.NativeMessage{ID: "msg_late_shell", Type: "shell"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/export") {
+			forward.ServeHTTP(w, r)
+
+			return
+		}
+		exported, exportErr := native.Export(r.Context(), s.nativeID)
+		require.NoError(t, exportErr)
+		value := fakeExport{Info: exported.Info}
+		for i, message := range exported.Messages {
+			if i == len(exported.Messages)-1 {
+				value.Messages = append(value.Messages, late)
+			}
+			decoded, decodeErr := message.Decode()
+			require.NoError(t, decodeErr)
+			value.Messages = append(value.Messages, decoded)
+		}
+		fakeData(w, value)
+	}))
+	defer proxy.Close()
+	rt.client.URL = proxy.URL
+	require.NoError(t, s.commitMirror(t.Context(), rt, nil))
+	rt.client.URL = native.URL
+	replaced, _, _ := store.writes()
+	require.Len(t, replaced, 2, "a message settling before mirrored ones republishes the generation")
+	var record sessionRecord
+	rows, _, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	messages := storedMessages(t, rows, record, s.nativeID)
+	require.Equal(t, late.ID, messages[len(messages)-2].ID, "the republished history keeps native order")
 }

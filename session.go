@@ -39,12 +39,11 @@ type session struct {
 	effort                string
 	models                []opencode.Model
 	artifacts             map[string]imageArtifact
-	// imagesWalked holds the root messages whose images were captured.
-	imagesWalked  map[string]struct{}
-	pendingInputs map[string][]opencode.InboxInput
+	pendingInputs         map[string][]opencode.InboxInput
 	// nativeInfos is the native information of the graph last read, parent first.
 	nativeInfos []json.RawMessage
-	// mirror publishes the session's store generation; mirrorMu serializes it.
+	// mirror publishes the session's store generation. A stored session has
+	// one from its establishment; an ephemeral session has none.
 	mirror *sessionlog.Mirror
 	// nativeMessages holds model identities for streamed response usage.
 	nativeMessages map[string]opencode.NativeMessage
@@ -69,7 +68,6 @@ type session struct {
 	dialogs   map[string]*dialog
 	callbacks sync.WaitGroup
 	openMu    sync.Mutex
-	mirrorMu  sync.Mutex
 	lcMu      sync.Mutex
 	lc        lifecycle.Publisher
 }
@@ -87,6 +85,12 @@ type binding struct {
 	results  chan nativePromptResult
 	endMu    sync.Mutex
 	endErr   error
+	// backlog holds, in order, events that arrived while events was full;
+	// forwarding marks the goroutine moving them into events.
+	backlogMu    sync.Mutex
+	backlog      []opencode.Event
+	backlogBytes int
+	forwarding   bool
 }
 
 // end records why the binding ended, keeping the first cause, and ends it.

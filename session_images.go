@@ -152,26 +152,10 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 
 // captureImages admits every image the mirror cannot replay from its own rows
 // through the output gate, which stores the sidecar copy a later replay reads.
-// Each root message is walked once. Only a storable artifact is decoded: a
-// data URL carries its bytes in the mirrored row, so rastering it here would
-// cost a decode and store nothing.
+// Only a storable artifact is decoded: a data URL carries its bytes in the
+// mirrored row, so rastering it here would cost a decode and store nothing.
 func (s *session) captureImages(messages []opencode.Message) {
-	fresh := make([]opencode.Message, 0, len(messages))
-
-	s.mu.Lock()
-	if s.imagesWalked == nil {
-		s.imagesWalked = make(map[string]struct{}, len(messages))
-	}
-
-	for _, message := range messages {
-		if _, walked := s.imagesWalked[message.ID]; !walked {
-			s.imagesWalked[message.ID] = struct{}{}
-			fresh = append(fresh, message)
-		}
-	}
-	s.mu.Unlock()
-
-	_ = walkImages(fresh, func(file opencode.NativeAttachment, used *int64) error {
+	_ = walkImages(messages, func(file opencode.NativeAttachment, used *int64) error {
 		if image.IsImageMIME(file.MIME) && storableArtifact(file) {
 			_ = s.outputFile(file, used)
 		}

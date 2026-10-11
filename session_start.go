@@ -11,6 +11,7 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
@@ -78,6 +79,10 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 		native = created.Data
 		s.nativeID = native.ID
 		s.id = acp.SessionId(native.ID)
+
+		if !s.ephemeral {
+			s.mirror = sessionlog.NewMirror(s.agent.store, string(s.id))
+		}
 	} else {
 		var err error
 

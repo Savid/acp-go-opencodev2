@@ -35,10 +35,10 @@ const (
 	RawEventMethod = "_opencode/rawEvent"
 	// AccountUsageMethod reads the addressed native provider's account usage.
 	AccountUsageMethod = "_opencode/accountUsage"
-	// SessionStoreFormat identifies the store layout this package writes: the
-	// graph's raw native messages under main, each run preceded by a session
-	// row, plus the session record with the graph's native session
-	// information under the config subpath.
+	// SessionStoreFormat identifies the store layout this package writes: one
+	// row per settled native message, naming its session, under main, plus the
+	// session record with the graph's native session information under the
+	// config subpath.
 	SessionStoreFormat = "opencode-session-export-v2"
 
 	vendor = "opencode"

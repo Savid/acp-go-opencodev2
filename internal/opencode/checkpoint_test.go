@@ -2,6 +2,8 @@ package opencode
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -16,41 +18,53 @@ func checkpointExport(t *testing.T, messages string) Export {
 	return value
 }
 
-func TestExecutionPrefix(t *testing.T) {
+func TestExecutionMarker(t *testing.T) {
 	t.Parallel()
-	const saved = `{"id":"msg_user","type":"user","text":"hello","unknown":9007199254740993}, {"id":"msg_done","type":"idle","outcome":"interrupted"}`
-	value := checkpointExport(t, saved+`, {"id":"msg_later","type":"user","text":"next"}`)
-	event := Event{ID: "evt_done", Type: "session.execution.interrupted", SessionID: "ses_root"}
-	prefix, err := value.ExecutionPrefix(event)
+	id, outcome, err := ExecutionMarker(Event{ID: "evt_done", Type: "session.execution.interrupted", SessionID: "ses_root"})
 	require.NoError(t, err)
-	require.Len(t, prefix.Messages, 2)
-	require.JSONEq(t, `{"id":"msg_user","type":"user","text":"hello","unknown":9007199254740993}`, string(prefix.Messages[0].Raw))
-	require.Contains(t, string(prefix.Messages[0].Raw), `"unknown":9007199254740993`)
-	require.Equal(t, value.Messages[1].Raw, prefix.Messages[1].Raw)
-	encoded, err := json.Marshal(prefix)
-	require.NoError(t, err)
-	require.NotContains(t, string(encoded), "msg_later")
-	var decoded Export
-	require.NoError(t, json.Unmarshal(encoded, &decoded))
-	require.Len(t, decoded.Messages, 2)
-	require.Equal(t, "ses_root", decoded.Info.ID)
+	require.Equal(t, "msg_done", id)
+	require.Equal(t, "interrupted", outcome)
 	for _, invalid := range []Event{
-		{ID: "evt_missing", Type: event.Type, SessionID: event.SessionID},
-		{ID: event.ID, Type: "session.execution.succeeded", SessionID: event.SessionID},
-		{ID: event.ID, Type: event.Type, SessionID: "ses_other"},
-		{ID: "done", Type: event.Type, SessionID: event.SessionID},
+		{ID: "evt_done", Type: "session.execution.started", SessionID: "ses_root"},
+		{ID: "evt_done", Type: "session.execution.succeeded"},
+		{ID: "done", Type: "session.execution.succeeded", SessionID: "ses_root"},
 	} {
-		_, err = value.ExecutionPrefix(invalid)
+		_, _, err = ExecutionMarker(invalid)
 		require.Error(t, err)
 	}
-	_, err = value.ExecutionPrefix(Event{ID: "evt_missing", Type: event.Type, SessionID: event.SessionID})
-	require.ErrorIs(t, err, ErrMarkerMissing)
-	require.Equal(t, prefix.Messages, value.CompletedPrefix().Messages)
-	child := checkpointExport(t, `{"id":"msg_first","type":"user"}`).CompletedPrefix()
-	require.Empty(t, child.Messages)
-	encoded, err = json.Marshal(child)
+}
+
+func TestStreamExport(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "missing") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"type":"not_found","message":"gone"}`))
+
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"extra":[1,{"a":2}],"messages":[{"id":"msg_a","type":"user","n":9007199254740993},{"id":"msg_b","type":"idle"}],"info":{"id":"ses_root"}},"tail":true}`))
+	}))
+	defer server.Close()
+	client := NewClient()
+	client.URL = server.URL
+	var info json.RawMessage
+	var messages []string
+	err := client.StreamExport(t.Context(), "ses_root", func(raw json.RawMessage) error {
+		info = raw
+
+		return nil
+	}, func(raw []byte) error {
+		messages = append(messages, string(raw))
+
+		return nil
+	})
 	require.NoError(t, err)
-	require.Contains(t, string(encoded), `"messages":[]`)
+	require.JSONEq(t, `{"id":"ses_root"}`, string(info))
+	require.Equal(t, []string{`{"id":"msg_a","type":"user","n":9007199254740993}`, `{"id":"msg_b","type":"idle"}`}, messages)
+	err = client.StreamExport(t.Context(), "missing", func(json.RawMessage) error { return nil }, func([]byte) error { return nil })
+	require.True(t, IsMissing(err))
 }
 
 func TestDecodeEvent(t *testing.T) {

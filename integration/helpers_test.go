@@ -352,27 +352,20 @@ func copyGeneration(t *testing.T, generation map[string][]acpcore.SessionStoreEn
 	return store
 }
 
-// storedMessages groups a stored main record's message rows by the session
-// row that precedes them.
+// storedMessages groups a stored main record's message rows by session.
 func storedMessages(t *testing.T, rows []acpcore.SessionStoreEntry) map[string][]opencode.Message {
 	t.Helper()
 	sessions := map[string][]opencode.Message{}
-	current := ""
-	for _, row := range rows {
-		var marker struct {
-			SessionID string `json:"sessionId"`
-			Type      string `json:"type"`
+	for _, raw := range rows {
+		var row struct {
+			SessionID string          `json:"sessionId"`
+			Message   json.RawMessage `json:"message"`
 		}
-		require.NoError(t, json.Unmarshal(row, &marker))
-		if marker.Type == "" {
-			current = marker.SessionID
-
-			continue
-		}
-		require.NotEmpty(t, current)
-		message, err := opencode.ParseMessage(json.RawMessage(row))
+		require.NoError(t, json.Unmarshal(raw, &row))
+		require.NotEmpty(t, row.SessionID)
+		message, err := opencode.ParseMessage(row.Message)
 		require.NoError(t, err)
-		sessions[current] = append(sessions[current], message)
+		sessions[row.SessionID] = append(sessions[row.SessionID], message)
 	}
 
 	return sessions

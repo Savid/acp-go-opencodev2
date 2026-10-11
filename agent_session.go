@@ -20,6 +20,7 @@ import (
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
@@ -434,6 +435,7 @@ func (a *Agent) restore(
 	s.nativeID = stored.record.NativeSessionID
 	s.rawEvents = wire.NewRawEvents(vendor, string(sessionID), vendor, start.meta.rawEvents)
 	s.title = stored.record.Title
+	s.mirror = sessionlog.NewMirror(a.store, string(sessionID))
 
 	rt, err := s.launch(ctx)
 	if err != nil {
@@ -445,6 +447,13 @@ func (a *Agent) restore(
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, nil, err
+	}
+
+	// The store holds this generation already; the first commit continues it.
+	if err := s.mirror.Adopt(stored.rows, stored.record, sessionlog.Position(graphMark(stored.graph))); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	if err := s.configureRuntime(ctx, rt, s.options, s.nativeID); err != nil {
@@ -564,7 +573,7 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 // copy, or the native one for an ephemeral session the store never holds.
 func (a *Agent) replayMessages(ctx context.Context, s *session, rt *binding) ([]opencode.Message, error) {
 	if s.ephemeral {
-		graph, err := s.readGraph(ctx, rt, nil)
+		graph, err := s.readGraph(ctx, rt)
 		if err != nil {
 			return nil, err
 		}
@@ -676,7 +685,7 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	listCtx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
 	defer cancel()
 
-	listCtx, finishList := a.observe.StartSessionStore(listCtx, "list")
+	listCtx, finishList := a.observe.StartSessionStore(listCtx, observer.SessionStoreList)
 	summaries, err := a.store.ListSessions(listCtx)
 	finishList(err)
 

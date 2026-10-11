@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
@@ -36,18 +36,17 @@ type sessionRecord struct {
 	Sessions              []json.RawMessage                `json:"sessions"`
 	Artifacts             map[string]imageArtifact         `json:"artifacts,omitempty"`
 	PendingInputs         map[string][]opencode.InboxInput `json:"pendingInputs,omitempty"`
-	UpdatedAtUnixMilli    int64                            `json:"updatedAtUnixMilli"`
 }
 
 func (s *session) record() sessionRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, Sessions: slices.Clone(s.nativeInfos), Artifacts: cloneArtifacts(s.artifacts), PendingInputs: clonePendingInputs(s.pendingInputs), UpdatedAtUnixMilli: time.Now().UnixMilli()}
+	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, Sessions: slices.Clone(s.nativeInfos), Artifacts: cloneArtifacts(s.artifacts), PendingInputs: clonePendingInputs(s.pendingInputs)}
 }
 
 func (r sessionRecord) validate(id string) error {
-	if !validNativeSessionID(r.NativeSessionID) || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 || len(r.Sessions) == 0 {
+	if !validNativeSessionID(r.NativeSessionID) || r.SessionID != id || !filepath.IsAbs(r.Cwd) || len(r.Sessions) == 0 {
 		return errors.New("invalid session record")
 	}
 
@@ -111,16 +110,14 @@ func validNativeSessionID(id string) bool {
 }
 
 // commitMirror publishes the native graph and its configuration through the
-// session's mirror, which appends only the rows it has not committed. An
+// session's mirror, which appends only the messages the store does not hold.
+// A history that no longer continues the mirror is republished whole. An
 // ephemeral session commits nothing: opencode's own database holds it until
 // the host deletes it.
 func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *opencode.Event) error {
 	if s.ephemeral {
 		return nil
 	}
-
-	s.mirrorMu.Lock()
-	defer s.mirrorMu.Unlock()
 
 	if rt == nil {
 		return errors.New("session has no native binding")
@@ -132,19 +129,16 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 		}
 	}
 
-	graph, err := s.readGraph(ctx, rt, terminal)
-	if err != nil {
-		return err
+	ctx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
+	source := s.mirrorSource(ctx, rt, terminal)
+	record := func(sessionlog.Tail) (any, error) { return s.record(), nil }
+
+	err := s.mirror.Commit(ctx, source, record)
+	if errors.Is(err, errRepublish) {
+		s.mirror.Reset()
+		err = s.mirror.Commit(ctx, source, record)
 	}
 
-	s.captureImages(graph[0].Messages)
-
-	if s.mirror == nil {
-		s.mirror = sessionlog.NewMirror(s.agent.store, string(s.id))
-	}
-
-	ctx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
-	err = s.mirror.Commit(ctx, sessionlog.Rows(graphRows(graph)), s.record())
 	finish(err)
 
 	if err == nil {
@@ -157,13 +151,14 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 }
 
 type storedSession struct {
+	rows   [][]byte
 	graph  []opencode.Export
 	record sessionRecord
 	found  bool
 }
 
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
-	ctx, finish := a.observe.StartSessionStore(ctx, "load")
+	ctx, finish := a.observe.StartSessionStore(ctx, observer.SessionStoreLoad)
 
 	var record sessionRecord
 
@@ -187,12 +182,12 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 		return storedSession{}, wire.RestoreRefused(ctx, a.log, vendor, id, err)
 	}
 
-	return storedSession{graph: graph, record: record, found: found}, nil
+	return storedSession{rows: rows, graph: graph, record: record, found: found}, nil
 }
 
 // loadRecord reads a stored session's configuration without its native rows.
 func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
-	ctx, finish := a.observe.StartSessionStore(ctx, "load_record")
+	ctx, finish := a.observe.StartSessionStore(ctx, observer.SessionStoreLoadRecord)
 
 	var record sessionRecord
 
@@ -235,7 +230,6 @@ func decodeStored(rows [][]byte, record sessionRecord) ([]opencode.Export, error
 		return nil, errors.New("native export missing")
 	}
 
-	current := -1
 	messages := make([]map[string]bool, len(graph))
 
 	for _, raw := range rows {
@@ -244,32 +238,26 @@ func decodeStored(rows [][]byte, record sessionRecord) ([]opencode.Export, error
 			return nil, err
 		}
 
-		if row.Type == "" {
-			at, ok := index[row.SessionID]
-			if !ok || row.ID != "" || at == current {
-				return nil, errors.New("invalid native session row")
-			}
-
-			current = at
-
-			continue
+		at, ok := index[row.SessionID]
+		if !ok {
+			return nil, errors.New("unrelated native message row")
 		}
 
-		message, err := opencode.ParseMessage(raw)
+		message, err := opencode.ParseMessage(row.Message)
 		if err != nil {
 			return nil, err
 		}
 
-		if current < 0 || message.ID == "" || messages[current][message.ID] {
+		if message.ID == "" || message.Type == "" || messages[at][message.ID] {
 			return nil, errors.New("invalid native message identity")
 		}
 
-		if messages[current] == nil {
-			messages[current] = map[string]bool{}
+		if messages[at] == nil {
+			messages[at] = map[string]bool{}
 		}
 
-		messages[current][message.ID] = true
-		graph[current].Messages = append(graph[current].Messages, message)
+		messages[at][message.ID] = true
+		graph[at].Messages = append(graph[at].Messages, message)
 	}
 
 	return graph, nil
@@ -318,7 +306,7 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 		}
 	}
 
-	verified, err := s.readGraph(ctx, rt, nil)
+	verified, err := s.readGraph(ctx, rt)
 	if err != nil {
 		return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 	}

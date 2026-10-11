@@ -63,8 +63,8 @@ Pass `_meta.opencode.options` on new, load, or resume, or use
 | `extraPathDirs` | Absolute directories prepended to the session's PATH in order |
 
 The environment plugin reads the addressed session's metadata through OpenCode's
-API before a session's first tool call and applies it once per session; applying
-a carrier again makes every session read it again. Child sessions inherit that
+API before a session's tool call and applies it once per session once a carrier
+is found; applying a carrier again makes every session read it again. Child sessions inherit that
 carrier through their native parent. OpenCode
 keeps its native authentication and configuration. Nonempty `mcpServers` and
 unknown owned options are invalid parameters.
@@ -102,19 +102,20 @@ the gateway's response ids, and its own message and part ids are not response id
 ### Persistence and runtime
 
 `SessionStoreFormat` is `opencode-session-export-v2`. The main subpath holds
-the settled native messages of one conversation and its descendants, each as its
-raw native row, merged by creation time with each session's order kept; a
-`{"sessionId":"..."}` row precedes every run of one session's messages. The
-`config` sidecar holds the native session information of the graph, parent
+the settled native messages of one conversation and its descendants, one row
+each: `{"sessionId":"...","message":RAW}` with the message's raw native bytes.
+Each session's messages keep native order. The `config` sidecar holds the native session information of the graph, parent
 first, the title, accepted options, captured local image bytes, and deferred
 synthetic inbox entries.
 
-A commit exports each session in the graph once. The root ends at the
-execution's durable idle marker, named by its terminal event; each descendant
-ends at its latest idle marker, or has empty history before its first completed
-execution. The commit appends only the rows the store does not hold and rewrites
-the configuration only when it changed; a history that no longer extends the
-stored rows republishes the generation. It is durable before terminal idle and
+A commit streams each session's export once and keeps only the messages past
+those the store holds, which it reads for their identity alone. The root ends at
+the execution's durable idle marker, named by its terminal event; each
+descendant ends at its latest idle marker, and its later messages follow in a
+later commit. The commit appends only the new rows and rewrites the
+configuration only when it changed. A message that settles before mirrored ones,
+or a mirrored session leaving the graph, republishes the generation. Restore
+continues the stored generation without rewriting it. It is durable before terminal idle and
 the prompt response, including on cancellation. Native cumulative usage and
 session timestamps retain their values at capture time and may include later
 execution. Commands without execution, configuration changes, restore, and close
@@ -131,9 +132,11 @@ histories are refused because the import API cannot replace a session. Local
 image replay remains available after its original file is removed. The default
 store is in memory; supply a durable store to restore across adapter restarts.
 
-Native events reach each session in order. A session that falls behind holds
-the shared event stream rather than losing an event; one whose queue stays full
-for two minutes ends its binding, and its turn fails naming that cause. A native
+Native events reach each session in order. Events for a session that falls
+behind wait in its own backlog while other sessions continue. A session whose
+queue takes no event for 15 seconds, or whose backlog passes 16 MiB, ends its
+binding: its native execution is interrupted and its turn fails naming that
+cause. A native
 protocol fault that ends a binding is logged and reported the same way.
 
 Close releases one session while peers retain the shared server. A server crash

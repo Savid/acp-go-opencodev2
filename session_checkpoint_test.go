@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
-	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
@@ -20,7 +19,7 @@ import (
 )
 
 func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
-	for _, mode := range []string{"growing", "changing tail", "changing child", "completed child", "missing marker", "wrong outcome", "export failure", "active child", "delivered inbox"} {
+	for _, mode := range []string{"growing", "changing tail", "changing child", "completed child", "missing marker", "wrong outcome", "export failure", "active child", "delivered inbox", "held marker"} {
 		t.Run(mode, func(t *testing.T) {
 			a, s, _ := newDirectSession(t)
 			response, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "HELLO"))
@@ -81,6 +80,10 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 			}))
 			defer proxy.Close()
 			rt.client.URL = proxy.URL
+			if mode != "held marker" {
+				// Read the whole history again, as the first commit of a mirror does.
+				s.mirror.Reset()
+			}
 			err = s.commitMirror(t.Context(), rt, &terminal)
 			rt.client.URL = native.URL
 			rows, _, loadErr := sessionlog.Load(t.Context(), a.store, string(s.id), &record)
@@ -109,6 +112,9 @@ func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
 			}
 			if mode == "changing child" {
 				require.Empty(t, storedMessages(t, rows, record, childID))
+			}
+			if mode == "held marker" {
+				require.Equal(t, before, rows, "a marker the store holds adds nothing")
 			}
 			if mode != "active child" {
 				exports := 1
@@ -171,38 +177,53 @@ func storedMessages(t *testing.T, rows [][]byte, record sessionRecord, id string
 }
 
 // BenchmarkTurnCommit measures one turn's commit of a long synthetic
-// transcript: append decodes one export and appends the turn's rows; republish
-// decodes the export twice and republishes every row.
+// transcript through the native export: append streams the export and appends
+// the turn's two messages; republish reads and republishes every message.
 func BenchmarkTurnCommit(b *testing.B) {
 	for _, mode := range []string{"append", "republish"} {
 		b.Run(mode, func(b *testing.B) {
-			store := acpcore.NewInMemorySessionStore()
-			mirror := sessionlog.NewMirror(store, "ses_bench")
 			text := strings.Repeat("x", 2048)
 			messages := make([]opencode.NativeMessage, 0, 4096)
 			for len(messages) < 2000 {
 				messages = append(messages, benchMessage(len(messages), text))
 			}
-			info := opencode.NativeSession{ID: "ses_bench"}
-			record := sessionRecord{SessionID: "ses_bench", NativeSessionID: "ses_bench", Cwd: "/work", UpdatedAtUnixMilli: 1}
+			var body atomic.Pointer[[]byte]
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/export"):
+					_, _ = w.Write(*body.Load())
+				case r.URL.Path == "/api/session/active":
+					_, _ = w.Write([]byte(`{"data":{}}`))
+				default:
+					_, _ = w.Write([]byte(`{"data":[]}`))
+				}
+			}))
+			defer server.Close()
+			client := opencode.NewClient()
+			client.URL = server.URL
+			a := NewAgent()
+			b.Cleanup(func() { _ = a.Close() })
+			s := &session{agent: a, id: "ses_bench", nativeID: "ses_bench", cwd: "/work"}
+			s.mirror = sessionlog.NewMirror(a.store, "ses_bench")
+			rt := &binding{client: client}
+			publish := func() {
+				encoded, err := json.Marshal(map[string]any{"data": fakeExport{Info: opencode.NativeSession{ID: "ses_bench"}, Messages: messages}})
+				require.NoError(b, err)
+				body.Store(&encoded)
+			}
+			publish()
+			record := func(sessionlog.Tail) (any, error) { return s.record(), nil }
+			require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil), record))
 			for b.Loop() {
 				b.StopTimer()
 				messages = append(messages, benchMessage(len(messages), text), benchMessage(len(messages)+1, text))
-				body, err := json.Marshal(fakeExport{Info: info, Messages: messages})
-				require.NoError(b, err)
-				b.StartTimer()
-				reads := 1
+				publish()
 				if mode == "republish" {
-					reads = 2
-					mirror.Reset()
+					s.mirror.Reset()
 				}
-				var export opencode.Export
-				for range reads {
-					require.NoError(b, json.Unmarshal(body, &export))
-				}
-				record.Sessions = []json.RawMessage{export.InfoRaw}
-				rows := graphRows([]nativeSnapshot{{Export: export}})
-				require.NoError(b, mirror.Commit(b.Context(), sessionlog.Rows(rows), record))
+				b.StartTimer()
+				require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil), record))
 			}
 		})
 	}

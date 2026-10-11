@@ -518,3 +518,20 @@ func storedGraph(t *testing.T, s *session, exports ...fakeExport) []nativeSnapsh
 
 	return graph
 }
+
+// storedRows lays a graph out as a whole stored generation's rows.
+func storedRows(graph []nativeSnapshot) [][]byte {
+	var rows [][]byte
+	for i := range graph {
+		for _, message := range graph[i].Messages {
+			rows = append(rows, mirrorRow(graph[i].Info.ID, message.Raw))
+		}
+	}
+
+	return rows
+}
+
+// recordOf is a mirror record function returning value.
+func recordOf(value any) func(sessionlog.Tail) (any, error) {
+	return func(sessionlog.Tail) (any, error) { return value, nil }
+}

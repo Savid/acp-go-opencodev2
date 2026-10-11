@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
-	"slices"
 	"strings"
 )
 
@@ -13,43 +12,20 @@ import (
 // durable idle marker.
 var ErrMarkerMissing = errors.New("native execution marker missing")
 
-// ExecutionPrefix cuts the export at the terminal event's durable idle marker.
-func (e Export) ExecutionPrefix(event Event) (Export, error) {
-	messageID := event.MessageID()
-	if messageID == "" || event.SessionID != e.Info.ID {
-		return Export{}, errors.New("invalid native execution boundary")
+// ExecutionMarker names the durable idle marker a terminal execution event
+// leaves in its session's history, and the outcome it records.
+func ExecutionMarker(event Event) (id, outcome string, err error) {
+	id = event.MessageID()
+	if id == "" || event.SessionID == "" {
+		return "", "", errors.New("invalid native execution boundary")
 	}
 
 	outcome, ok := strings.CutPrefix(event.Type, "session.execution.")
 	if !ok || outcome != "succeeded" && outcome != "failed" && outcome != "interrupted" {
-		return Export{}, errors.New("invalid native execution outcome")
+		return "", "", errors.New("invalid native execution outcome")
 	}
 
-	for i := range e.Messages {
-		message := &e.Messages[i]
-		if message.ID == messageID && message.Type == "idle" && message.Outcome == outcome {
-			e.Messages = e.Messages[:i+1]
-
-			return e, nil
-		}
-	}
-
-	return Export{}, ErrMarkerMissing
-}
-
-// CompletedPrefix retains only executions ending in a durable idle marker.
-func (e Export) CompletedPrefix() Export {
-	for i := range slices.Backward(e.Messages) {
-		if e.Messages[i].Type == "idle" {
-			e.Messages = e.Messages[:i+1]
-
-			return e
-		}
-	}
-
-	e.Messages = e.Messages[:0]
-
-	return e
+	return id, outcome, nil
 }
 
 // ContainsHistory verifies saved identities, order, and content. Export omits

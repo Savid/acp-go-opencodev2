@@ -887,6 +887,10 @@ func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
 			s.mu.Unlock()
 
 			store.fail.Store(failCommit)
+			// A changed record gives the close commit something to write.
+			s.mu.Lock()
+			s.title = "closing"
+			s.mu.Unlock()
 			closeErr := s.close(t.Context())
 
 			terminalIdle := false
