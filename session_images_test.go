@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -199,8 +203,8 @@ func TestLocalImagesSurviveFullHistoryRestore(t *testing.T) {
 		Info:     opencode.NativeSession{ID: s.nativeID, Location: opencode.Location{Directory: dir}},
 		Messages: []opencode.NativeMessage{{ID: "msg_images", Type: roleAssistant, Content: content}},
 	})
-	s.captureImages(graph[0].Messages)
-	require.NoError(t, sessionlog.NewMirror(store, string(s.id)).Commit(t.Context(), sessionlog.Rows(storedRows(graph)), recordOf(s.record())))
+	s.artifacts = s.captureImages(graph[0].Messages)
+	require.NoError(t, commitErr(sessionlog.NewMirror(store, string(s.id)).Commit(t.Context(), sessionlog.Rows(storedRows(graph)), recordOf(s.record()))))
 	require.NoError(t, os.Remove(path))
 	h := newHarness(t, WithSessionStore(store))
 	h.initialize()
@@ -214,4 +218,47 @@ func TestLocalImagesSurviveFullHistoryRestore(t *testing.T) {
 		}
 	}
 	require.Equal(t, len(content), images)
+}
+
+func TestCapturedImagesJoinTheSessionOnlyWithTheirCommit(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "image.png")
+	data, err := base64.StdEncoding.DecodeString(promptRaster(t))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	message := opencode.NativeMessage{ID: "msg_image", Type: roleAssistant, Content: []opencode.Content{{Type: partFile, URI: path, MIME: image.MIMEPNG}}}
+	export, err := json.Marshal(map[string]any{"data": fakeExport{Info: opencode.NativeSession{ID: "ses_images"}, Messages: []opencode.NativeMessage{message}}})
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/export"):
+			_, _ = w.Write(export)
+		case r.URL.Path == "/api/session/active":
+			_, _ = w.Write([]byte(`{"data":{}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer server.Close()
+	client := opencode.NewClient()
+	client.URL = server.URL
+	store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	a := NewAgent(WithSessionStore(store))
+	t.Cleanup(func() { _ = a.Close() })
+	s := &session{agent: a, id: "ses_images", nativeID: "ses_images", cwd: dir}
+	s.mirror = sessionlog.NewMirror(store, string(s.id))
+	b := &binding{client: client}
+	store.fail.Store(true)
+	require.ErrorContains(t, s.commitMirror(t.Context(), b, nil), "injected store failure")
+	s.mu.Lock()
+	require.Empty(t, s.artifacts, "a failed commit keeps no captured image")
+	s.mu.Unlock()
+	store.fail.Store(false)
+	require.NoError(t, s.commitMirror(t.Context(), b, nil))
+	s.mu.Lock()
+	require.Contains(t, s.artifacts, attachmentID("msg_image", 0))
+	s.mu.Unlock()
+	require.Contains(t, storedRecord(t, store, s.id).Artifacts, attachmentID("msg_image", 0), "the commit stores the image it captured")
 }

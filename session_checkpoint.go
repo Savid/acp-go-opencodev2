@@ -24,8 +24,8 @@ const markerAttempts = 5
 const markerRetryDelay = 100 * time.Millisecond
 
 // errRepublish reports a native history that no longer continues the mirrored
-// rows: a message settled before ones already mirrored, or a mirrored session
-// left the graph.
+// rows: mirrored messages changed or are gone, or a mirrored session left the
+// graph.
 var errRepublish = errors.New("native history no longer continues the mirror")
 
 type nativeSnapshot struct {
@@ -67,7 +67,7 @@ func writeMessage(digest hash.Hash, raw []byte) {
 
 // mirrorSource reads the native graph for one commit, leaving its latest read
 // in last; the mirror may run it more than once, so the session takes the
-// read's state only after the commit succeeds. Continuing from a mark,
+// read's state, captured images included, only after the commit succeeds. Continuing from a mark,
 // it streams each session's export and keeps only the messages past what the
 // store holds, so a held message's bytes are never retained; from the zero
 // cursor it returns the whole graph. With a terminal event the root ends at
@@ -99,7 +99,7 @@ func (s *session) mirrorSource(ctx context.Context, b *binding, terminal *openco
 			return sessionlog.Tail{}, err
 		}
 
-		s.captureImages(tail.root)
+		tail.artifacts = s.captureImages(tail.root)
 		*last = tail
 
 		return sessionlog.Tail{Rows: tail.rows, Next: sessionlog.Position(tail.mark), Full: !continues}, nil
@@ -109,11 +109,13 @@ func (s *session) mirrorSource(ctx context.Context, b *binding, terminal *openco
 // graphTail is one read of the native graph: the rows past the mark, the
 // mark after them, and the graph's information and undelivered inputs.
 type graphTail struct {
-	rows   [][]byte
-	mark   mirrorMark
-	infos  []json.RawMessage
-	inputs map[string][]opencode.InboxInput
-	root   []opencode.Message
+	// artifacts are the images the read's new root messages captured.
+	artifacts map[string]imageArtifact
+	rows      [][]byte
+	mark      mirrorMark
+	infos     []json.RawMessage
+	inputs    map[string][]opencode.InboxInput
+	root      []opencode.Message
 }
 
 func (s *session) readTail(ctx context.Context, b *binding, terminal *opencode.Event, mark mirrorMark) (graphTail, error) {
@@ -174,7 +176,7 @@ func (s *session) readTail(ctx context.Context, b *binding, terminal *opencode.E
 
 	for id := range mark {
 		if _, ok := tail.mark[id]; !ok {
-			return graphTail{}, errRepublish
+			return graphTail{}, fmt.Errorf("%w: mirrored session %s left the graph", errRepublish, id)
 		}
 	}
 
@@ -298,11 +300,11 @@ func readSessionTail(ctx context.Context, b *binding, id string, held heldHistor
 	}
 
 	if index < held.count {
-		return sessionTail{}, fmt.Errorf("native history of %s shrank from %d to %d messages", id, held.count, index)
+		return sessionTail{}, fmt.Errorf("%w: native history of %s shrank from %d to %d messages", errRepublish, id, held.count, index)
 	}
 
 	if held.count > 0 && [sha256.Size]byte(digest.Sum(nil)) != held.digest {
-		return sessionTail{}, errRepublish
+		return sessionTail{}, fmt.Errorf("%w: mirrored messages of %s changed", errRepublish, id)
 	}
 
 	if read.fresh, err = cutFresh(read.fresh, cut, marker, held.count); err != nil {

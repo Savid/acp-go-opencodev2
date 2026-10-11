@@ -27,12 +27,20 @@ type imageArtifact struct {
 }
 
 // keepArtifact retains the bytes or refusal needed to replay native history.
+// The caller holds s.mu.
 func (s *session) keepArtifact(id string, artifact imageArtifact) {
 	if s.artifacts == nil {
 		s.artifacts = map[string]imageArtifact{}
 	}
 
 	s.artifacts[id] = artifact
+}
+
+// storeArtifact keeps an artifact the session admitted while emitting.
+func (s *session) storeArtifact(id string, artifact imageArtifact) {
+	s.mu.Lock()
+	s.keepArtifact(id, artifact)
+	s.mu.Unlock()
 }
 
 func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
@@ -42,7 +50,8 @@ func cloneArtifacts(values map[string]imageArtifact) map[string]imageArtifact {
 	return result
 }
 
-func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *image.OutputError) {
+// imageBytes admits one image, handing a storable admission to keep.
+func (s *session) imageBytes(file opencode.NativeAttachment, keep func(string, imageArtifact)) ([]byte, string, *image.OutputError) {
 	limit := s.agent.options.ImageLimits.core().EffectiveOutputPerImage()
 	s.mu.Lock()
 	cached, ok := s.artifacts[file.ID]
@@ -106,15 +115,19 @@ func (s *session) imageBytes(file opencode.NativeAttachment) ([]byte, string, *i
 	}
 
 	if storableArtifact(file) {
-		s.mu.Lock()
-		s.keepArtifact(file.ID, imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: imageReference(file.URL)})
-		s.mu.Unlock()
+		keep(file.ID, imageArtifact{Data: base64.StdEncoding.EncodeToString(data), MIME: mime, Reference: imageReference(file.URL)})
 	}
 
 	return data, mime, nil
 }
 
 func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.ContentBlock {
+	return s.admitFile(file, used, s.storeArtifact)
+}
+
+// admitFile maps one native file to ACP content, handing each storable
+// admission or refusal to keep.
+func (s *session) admitFile(file opencode.NativeAttachment, used *int64, keep func(string, imageArtifact)) []acp.ContentBlock {
 	if file.Data != "" {
 		file.URL = "data:" + file.MIME + ";base64," + file.Data
 	}
@@ -127,7 +140,7 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 		return nil
 	}
 
-	data, mime, refusal := s.imageBytes(file)
+	data, mime, refusal := s.imageBytes(file, keep)
 	if refusal == nil && used != nil {
 		*used += int64(len(data))
 		if *used > s.agent.options.ImageLimits.core().EffectiveOutputPerToolCall() {
@@ -137,9 +150,7 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 
 	if refusal != nil {
 		if storableArtifact(file) {
-			s.mu.Lock()
-			s.keepArtifact(file.ID, imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)})
-			s.mu.Unlock()
+			keep(file.ID, imageArtifact{Refusal: refusal.Reason, Reference: imageReference(file.URL)})
 		}
 
 		guidance, _ := refusal.Guidance()
@@ -151,17 +162,23 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 }
 
 // captureImages admits every image the mirror cannot replay from its own rows
-// through the output gate, which stores the sidecar copy a later replay reads.
-// Only a storable artifact is decoded: a data URL carries its bytes in the
-// mirrored row, so rastering it here would cost a decode and store nothing.
-func (s *session) captureImages(messages []opencode.Message) {
+// through the output gate and returns the sidecar copies a later replay reads,
+// leaving the session's own artifacts to the caller. Only a storable artifact
+// is decoded: a data URL carries its bytes in the mirrored row, so rastering
+// it here would cost a decode and store nothing.
+func (s *session) captureImages(messages []opencode.Message) map[string]imageArtifact {
+	captured := map[string]imageArtifact{}
+	keep := func(id string, artifact imageArtifact) { captured[id] = artifact }
+
 	_ = walkImages(messages, func(file opencode.NativeAttachment, used *int64) error {
 		if image.IsImageMIME(file.MIME) && storableArtifact(file) {
-			_ = s.outputFile(file, used)
+			_ = s.admitFile(file, used, keep)
 		}
 
 		return nil
 	})
+
+	return captured
 }
 
 func walkImages(messages []opencode.Message, visit func(opencode.NativeAttachment, *int64) error) error {

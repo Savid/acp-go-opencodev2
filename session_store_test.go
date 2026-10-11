@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -184,7 +185,7 @@ func TestRestoreRefusesMissingImageArtifact(t *testing.T) {
 	uncaptured := record
 	uncaptured.Artifacts = nil
 
-	require.NoError(t, sessionlog.NewMirror(store, string(session.SessionId)).Commit(t.Context(), sessionlog.Rows(stored), recordOf(uncaptured)))
+	require.NoError(t, commitErr(sessionlog.NewMirror(store, string(session.SessionId)).Commit(t.Context(), sessionlog.Rows(stored), recordOf(uncaptured))))
 
 	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, cwd))
 	require.Equal(t, vendor+"_"+wire.TokenRestoreFailed, requestErrorData(t, err)[wire.FieldError],
@@ -257,7 +258,7 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), recordOf(record)))
+	require.NoError(t, commitErr(sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), recordOf(record))))
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -885,4 +886,57 @@ func TestMirrorRepublishesAHeldMessageThatChanged(t *testing.T) {
 		changed = changed || strings.Contains(string(message.Raw), "completed since its capture")
 	}
 	require.True(t, changed, "the store holds the message as it is now")
+}
+
+func TestMirrorRepublishesAShorterNativeHistory(t *testing.T) {
+	t.Parallel()
+	store := &writeCountingStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	logs := &logBuffer{}
+	a := NewAgent(testOptions(t, WithSessionStore(store), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(created.SessionId, "HELLO"))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	b := s.binding
+	native := *b.client
+	target, err := url.Parse(native.URL)
+	require.NoError(t, err)
+	forward := httputil.NewSingleHostReverseProxy(target)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/export") {
+			forward.ServeHTTP(w, r)
+
+			return
+		}
+		exported, exportErr := native.Export(r.Context(), s.nativeID)
+		require.NoError(t, exportErr)
+		value := fakeExport{Info: exported.Info}
+		for _, message := range exported.Messages[:len(exported.Messages)-1] {
+			decoded, decodeErr := message.Decode()
+			require.NoError(t, decodeErr)
+			value.Messages = append(value.Messages, decoded)
+		}
+		fakeData(w, value)
+	}))
+	defer proxy.Close()
+	b.client.URL = proxy.URL
+	require.NoError(t, s.commitMirror(t.Context(), b, nil), "a shorter native history republishes instead of failing")
+	b.client.URL = native.URL
+	replaced, _, _ := store.writes()
+	require.Len(t, replaced, 2)
+	var record sessionRecord
+	rows, _, err := sessionlog.Load(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	exported, err := native.Export(t.Context(), s.nativeID)
+	require.NoError(t, err)
+	require.Len(t, storedMessages(t, rows, record, s.nativeID), len(exported.Messages)-1)
+	require.Contains(t, logs.String(), "session mirror republished")
+	require.Contains(t, logs.String(), "reason=rewritten")
+	require.Contains(t, logs.String(), "session_id="+string(created.SessionId))
+	require.Contains(t, logs.String(), "shrank")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"maps"
 	"path/filepath"
 	"reflect"
@@ -139,22 +140,54 @@ func (s *session) commitMirror(ctx context.Context, b *binding, terminal *openco
 		value.Sessions = last.infos
 		value.PendingInputs = last.inputs
 
+		if len(last.artifacts) > 0 {
+			if value.Artifacts == nil {
+				value.Artifacts = map[string]imageArtifact{}
+			}
+
+			maps.Copy(value.Artifacts, last.artifacts)
+		}
+
 		return value, nil
 	}
 
-	err := s.mirror.Commit(ctx, source, record)
+	var cause error
+
+	report, err := s.mirror.Commit(ctx, source, record)
 	if errors.Is(err, errRepublish) {
+		// The native history no longer continues the mirror: republishing it
+		// is a rewrite, though the reset mirror sees a first commit.
+		cause = err
+
 		s.mirror.Reset()
-		err = s.mirror.Commit(ctx, source, record)
+
+		report, err = s.mirror.Commit(ctx, source, record)
+		if err == nil {
+			report.Republish = sessionlog.RepublishRewritten
+		}
 	}
 
+	s.agent.observe.RecordRepublish(ctx, string(report.Republish))
 	finish(err)
+
+	if report.Recovery() {
+		attrs := []any{slog.String("session_id", string(s.id)), slog.String("reason", string(report.Republish)), slog.Any("append_error", report.AppendErr)}
+		if cause != nil {
+			attrs = append(attrs, slog.String("cause", cause.Error()))
+		}
+
+		s.agent.log.WarnContext(ctx, "session mirror republished", attrs...)
+	}
 
 	if err == nil {
 		s.mu.Lock()
 		s.persisted = true
 		s.pendingInputs = last.inputs
 		s.nativeInfos = last.infos
+
+		for id, artifact := range last.artifacts {
+			s.keepArtifact(id, artifact)
+		}
 		s.mu.Unlock()
 	}
 

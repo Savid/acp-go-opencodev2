@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -535,3 +536,26 @@ func storedRows(graph []nativeSnapshot) [][]byte {
 func recordOf(value any) func(sessionlog.Tail) (any, error) {
 	return func(sessionlog.Tail) (any, error) { return value, nil }
 }
+
+// logBuffer collects log output written by concurrent loggers.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.String()
+}
+
+// commitErr is the error of a mirror commit.
+func commitErr(_ sessionlog.CommitReport, err error) error { return err }
