@@ -32,7 +32,7 @@ type session struct {
 	rawEvents             *wire.RawEvents
 	gate                  chan struct{}
 	mu                    sync.Mutex
-	runtime               *binding
+	binding               *binding
 	model                 string
 	effort                string
 	models                []opencode.Model
@@ -119,7 +119,7 @@ const (
 type turn struct {
 	cycle
 	submission lifecycle.Submission
-	runtime    *binding
+	binding    *binding
 	// cancelTurn ends the turn's own context. The session owns it, so a
 	// refused peer prompt cancelling this prompt's request context never ends
 	// a live turn.
@@ -148,7 +148,7 @@ var errDialogCancelled = errors.New("dialog cancelled by the session")
 
 func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	if rt != nil && rt.alive() {
@@ -175,7 +175,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*binding, error) {
 
 func (s *session) recoverRuntime(ctx context.Context) (*binding, error) {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	selection := OpenCodeOptions{Model: s.model, Mode: s.mode, Effort: s.effort}
 	s.mu.Unlock()
 
@@ -289,14 +289,14 @@ func (s *session) runtimeEnded(ctx context.Context, rt *binding) {
 	}
 	rt.server.mu.Unlock()
 	s.mu.Lock()
-	if s.runtime != rt {
+	if s.binding != rt {
 		s.mu.Unlock()
 
 		return
 	}
 
 	t, c, closing := s.turn, s.cycle, s.closing
-	if t != nil && t.runtime != rt {
+	if t != nil && t.binding != rt {
 		t = nil
 	}
 
@@ -336,8 +336,8 @@ func (s *session) clearRuntime(rt *binding) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.runtime == rt {
-		s.runtime = nil
+	if s.binding == rt {
+		s.binding = nil
 	}
 }
 
@@ -379,7 +379,7 @@ func (s *session) abort(ctx context.Context, rt *binding) {
 func (s *session) cancel(ctx context.Context) {
 	s.mu.Lock()
 	t, c := s.turn, s.cycle
-	rt := s.runtime
+	rt := s.binding
 
 	if t != nil {
 		c = &t.cycle
@@ -461,7 +461,7 @@ func (s *session) cycleCancelled(c *cycle) bool {
 
 func (s *session) registerDialog(id string, cancel context.CancelCauseFunc) (func(), bool) {
 	s.mu.Lock()
-	if s.dialogs[id] != nil || s.closing || s.runtime == nil || ((s.turn != nil && (s.turn.cancelled || s.turn.settling)) || (s.cycle != nil && (s.cycle.cancelled || s.cycle.settling))) {
+	if s.dialogs[id] != nil || s.closing || s.binding == nil || ((s.turn != nil && (s.turn.cancelled || s.turn.settling)) || (s.cycle != nil && (s.cycle.cancelled || s.cycle.settling))) {
 		s.mu.Unlock()
 		cancel(errDialogCancelled)
 
@@ -566,7 +566,7 @@ func (s *session) close(ctx context.Context) error {
 	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
 
-	t, rt, closingCycle := s.turn, s.runtime, s.cycle
+	t, rt, closingCycle := s.turn, s.binding, s.cycle
 	if t != nil {
 		t.cancelled = true
 	}

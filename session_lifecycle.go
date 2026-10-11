@@ -37,7 +37,7 @@ func (s *session) openStream(ctx context.Context, rt *binding) error {
 		return errSessionClosing
 	}
 
-	if rt == nil || s.runtime != rt || !rt.alive() {
+	if rt == nil || s.binding != rt || !rt.alive() {
 		s.mu.Unlock()
 
 		return wire.RuntimeUnavailable(vendor)

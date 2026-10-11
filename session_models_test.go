@@ -115,7 +115,7 @@ func TestSetConfigOptionAppliesAndRefuses(t *testing.T) {
 
 func TestConfigChangeUsesOnlyAddressedSelector(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.runtime
+	rt := s.binding
 	target, err := url.Parse(rt.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)
@@ -153,7 +153,7 @@ func TestFailedNativeConfigChangeRebindsCommittedSelection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, s, _ := newDirectSession(t)
-			rt := s.runtime
+			rt := s.binding
 			before := s.record()
 			target, err := url.Parse(rt.client.URL)
 			require.NoError(t, err)
@@ -221,7 +221,7 @@ func TestNativeDefaultsAndChangedSelectionSurviveRebind(t *testing.T) {
 	require.Equal(t, acp.SessionConfigValueId("fake/vision"), configOption(created.ConfigOptions, configModel).CurrentValue)
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
-	native, err := s.runtime.client.Session(t.Context(), s.nativeID)
+	native, err := s.binding.client.Session(t.Context(), s.nativeID)
 	require.NoError(t, err)
 	require.Equal(t, "low", native.Model.Variant)
 	require.Equal(t, "plan", native.Agent)
@@ -229,7 +229,7 @@ func TestNativeDefaultsAndChangedSelectionSurviveRebind(t *testing.T) {
 	require.NoError(t, err)
 	_, err = a.SetSessionConfigOption(t.Context(), wire.SetConfigOptionRequest(s.id, configMode, "build"))
 	require.NoError(t, err)
-	s.stopRuntime(t.Context(), s.runtime)
+	s.stopRuntime(t.Context(), s.binding)
 	s.fenceStream()
 	rt, err := s.ensureRuntime(t.Context())
 	require.NoError(t, err)

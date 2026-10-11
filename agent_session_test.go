@@ -314,7 +314,7 @@ func TestRestoreAfterRuntimeLoss(t *testing.T) {
 	for _, load := range []bool{false, true} {
 		t.Run(map[bool]string{false: "resume", true: "load"}[load], func(t *testing.T) {
 			a, s, cwd := newDirectSession(t)
-			original := s.runtime
+			original := s.binding
 			original.server.close()
 			<-original.done
 			if load {
@@ -327,7 +327,7 @@ func TestRestoreAfterRuntimeLoss(t *testing.T) {
 			restored, err := a.session(t.Context(), s.id)
 			require.NoError(t, err)
 			restored.mu.Lock()
-			rebound := restored.runtime
+			rebound := restored.binding
 			restored.mu.Unlock()
 			require.NotNil(t, rebound, "load/resume reported success but left the session unbound")
 			require.NotSame(t, original, rebound)
@@ -343,7 +343,7 @@ func TestRestoreChangesNativeCwd(t *testing.T) {
 	_, err = a.ResumeSession(t.Context(), wire.ResumeSessionRequest(s.id, newcwd))
 	require.NoError(t, err)
 	restored := a.sessions[s.id]
-	native, err := restored.runtime.client.Session(t.Context(), s.nativeID)
+	native, err := restored.binding.client.Session(t.Context(), s.nativeID)
 	require.NoError(t, err)
 	require.Equal(t, newcwd, restored.cwd)
 	require.NotEqual(t, oldcwd, native.Location.Directory, "resumed session still executes in its old directory")
@@ -358,7 +358,7 @@ func TestRestoreRefusesPoisonedSession(t *testing.T) {
 			t.Run(operation+"/"+state, func(t *testing.T) {
 				t.Parallel()
 				a, s, cwd := newDirectSession(t)
-				rt := s.runtime
+				rt := s.binding
 				s.poisonSession(t.Context(), "native_session_identity_drift")
 				if state == "ended" {
 					rt.cancel()

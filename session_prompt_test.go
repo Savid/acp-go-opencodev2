@@ -201,7 +201,7 @@ func TestNativeExecutionErrorPreservesProviderDetails(t *testing.T) {
 
 func TestCommandWithoutExecutionCompletes(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.runtime
+	rt := s.binding
 	originalURL, _ := url.Parse(rt.client.URL)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
 	accepted := make(chan struct{})
@@ -230,7 +230,7 @@ func TestCommandWithoutExecutionCompletes(t *testing.T) {
 }
 func TestCancelBeforeNativeAcceptance(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.runtime
+	rt := s.binding
 	originalURL, _ := url.Parse(rt.client.URL)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
 	entered := make(chan struct{})
@@ -285,7 +285,7 @@ func TestCommandCompletionWaitsForStream(t *testing.T) {
 	a, s, _ := newDirectSession(t)
 	rec := newRecorder()
 	a.attach(rec, nil)
-	rt := s.runtime
+	rt := s.binding
 	originalURL, err := url.Parse(rt.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(originalURL)
@@ -365,7 +365,7 @@ func TestCommandControlBeforeExecution(t *testing.T) {
 			require.NoError(t, err)
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
-			rt := s.runtime
+			rt := s.binding
 			target, err := url.Parse(rt.client.URL)
 			require.NoError(t, err)
 			forward := httputil.NewSingleHostReverseProxy(target)
@@ -438,7 +438,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	require.NoError(t, err)
 	s, err := a.session(ctx, created.SessionId)
 	require.NoError(t, err)
-	rt := s.runtime
+	rt := s.binding
 	native := *rt.client
 	target, err := url.Parse(native.URL)
 	require.NoError(t, err)
@@ -645,7 +645,7 @@ func requireCommittedBeforeResponse(t *testing.T, entries []string) {
 
 func TestShutdownInterruptEndsBindingWithoutSnapshot(t *testing.T) {
 	a, s, _ := newDirectSession(t)
-	rt := s.runtime
+	rt := s.binding
 	target, err := url.Parse(rt.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)

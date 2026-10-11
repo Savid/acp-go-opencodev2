@@ -28,7 +28,7 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 	closing := s.closing
 
 	if !closing {
-		s.runtime = rt
+		s.binding = rt
 	}
 	s.mu.Unlock()
 

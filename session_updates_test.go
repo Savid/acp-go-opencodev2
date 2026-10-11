@@ -108,7 +108,7 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
 			s.mu.Lock()
-			rt := s.runtime
+			rt := s.binding
 			require.Nil(t, s.turn)
 			s.mu.Unlock()
 			data, err := os.ReadFile("testdata/native/agent-origin.json")
@@ -415,7 +415,7 @@ func TestCancelDuringUsageCostRead(t *testing.T) {
 	a, s, _ := newDirectSession(t)
 	rec := newRecorder()
 	a.attach(rec, nil)
-	rt := s.runtime
+	rt := s.binding
 	target, err := url.Parse(rt.client.URL)
 	require.NoError(t, err)
 	forward := httputil.NewSingleHostReverseProxy(target)

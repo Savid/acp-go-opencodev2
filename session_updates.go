@@ -112,7 +112,7 @@ func isTurnAcceptance(t *turn, eventType, inboxID string) bool {
 
 func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.Event) {
 	s.mu.Lock()
-	t, c, closing, current := s.turn, s.cycle, s.closing, s.runtime == rt
+	t, c, closing, current := s.turn, s.cycle, s.closing, s.binding == rt
 	s.mu.Unlock()
 
 	if !current || closing && t == nil && c == nil {
@@ -328,7 +328,7 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, message openc
 	c.state.usage = addUsage(c.state.usage, message.Tokens)
 	update := acp.SessionUsageUpdate{Used: contextTokens(message.Tokens), Size: s.knownContextWindow(message.Model.ProviderID, message.Model.ID)}
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	if rt != nil {
@@ -477,7 +477,7 @@ func (s *session) emitTool(ctx context.Context, state *cycleState, id, name stri
 func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
 	c := &cycle{Cycle: s.lc.NewAgentCycle(), done: make(chan struct{})}
 	s.mu.Lock()
-	if s.turn != nil || s.cycle != nil || s.closing || s.runtime != rt {
+	if s.turn != nil || s.cycle != nil || s.closing || s.binding != rt {
 		s.mu.Unlock()
 
 		return nil
@@ -489,7 +489,7 @@ func (s *session) openAgentCycle(ctx context.Context, rt *binding) *cycle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.runtime != rt || s.cycle != c || s.closing {
+	if s.binding != rt || s.cycle != c || s.closing {
 		return nil
 	}
 

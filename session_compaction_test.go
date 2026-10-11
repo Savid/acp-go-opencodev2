@@ -188,7 +188,7 @@ func TestCompactionSendFailureKeepsRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	rt := &binding{cancel: cancel}
-	s.runtime = rt
+	s.binding = rt
 	for _, id := range []string{"evt_failed", "evt_next"} {
 		s.handleEvent(ctx, rt, opencode.Event{ID: id, Type: eventCompactionEnded, Data: json.RawMessage(`{"sessionID":"root"}`)})
 	}

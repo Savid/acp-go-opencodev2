@@ -205,13 +205,13 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	}
 
 	s.mu.Lock()
-	if s.runtime != rt || !rt.alive() {
+	if s.binding != rt || !rt.alive() {
 		s.mu.Unlock()
 
 		return acp.PromptResponse{}, s.transportFailure(context.WithoutCancel(ctx), rt, nil)
 	}
 
-	t.runtime = rt
+	t.binding = rt
 	s.mu.Unlock()
 
 	requestCtx, requestCancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -450,7 +450,7 @@ func (s *session) boundTo(rt *binding) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.runtime == rt && rt.alive()
+	return s.binding == rt && rt.alive()
 }
 
 func (s *session) promptRequest(mapped nativePrompt, id string) (string, any) {

@@ -148,7 +148,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 // response on a served connection, and runs it inline for an embedded host.
 func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	if t := a.transportRef(); t != nil {
@@ -163,7 +163,7 @@ func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 			}
 
 			s.mu.Lock()
-			current := !s.closing && s.runtime == rt
+			current := !s.closing && s.binding == rt
 			s.mu.Unlock()
 
 			if current {
@@ -385,7 +385,7 @@ func (a *Agent) restore(
 		}
 
 		active.mu.Lock()
-		rt := active.runtime
+		rt := active.binding
 		active.mu.Unlock()
 
 		if sameCarrier(active, start) {
@@ -507,7 +507,7 @@ func (a *Agent) restore(
 // restoreActive keeps the session's foreground held through recovery and replay.
 func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, release func()) (*session, func(), error) {
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 
 	recovered := rt == nil || !rt.alive()

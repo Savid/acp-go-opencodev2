@@ -36,7 +36,7 @@ func TestSharedRuntimeAndFreshHomeRestore(t *testing.T) {
 	require.NoError(t, err)
 	two, err := a.session(t.Context(), second.SessionId)
 	require.NoError(t, err)
-	require.Same(t, one.runtime.server, two.runtime.server)
+	require.Same(t, one.binding.server, two.binding.server)
 	response, err := a.Prompt(t.Context(), wire.TextPromptRequest(first.SessionId, "remember"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
@@ -163,7 +163,7 @@ func TestEphemeralSessionRecoversAfterRuntimeLoss(t *testing.T) {
 			require.NoError(t, err)
 			s, err := a.session(t.Context(), created.SessionId)
 			require.NoError(t, err)
-			original := s.runtime
+			original := s.binding
 			history, err := original.client.Export(t.Context(), s.nativeID)
 			require.NoError(t, err)
 			peer, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir(), ephemeralMeta()))
@@ -182,9 +182,9 @@ func TestEphemeralSessionRecoversAfterRuntimeLoss(t *testing.T) {
 			require.NoError(t, err)
 			restored, err := a.session(t.Context(), s.id)
 			require.NoError(t, err)
-			require.NotSame(t, original, restored.runtime)
-			require.True(t, restored.runtime.alive())
-			after, err := restored.runtime.client.Export(t.Context(), restored.nativeID)
+			require.NotSame(t, original, restored.binding)
+			require.True(t, restored.binding.alive())
+			after, err := restored.binding.client.Export(t.Context(), restored.nativeID)
 			require.NoError(t, err)
 			require.GreaterOrEqual(t, len(after.Messages), len(history.Messages))
 			require.Equal(t, history.Messages, after.Messages[:len(history.Messages)])
@@ -333,7 +333,7 @@ func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
 	require.NoError(t, err)
 
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	require.NotNil(t, rt)
 
@@ -356,7 +356,7 @@ func TestDepartingBindingIsNeverHandedToAPrompt(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	bound := s.runtime == rt
+	bound := s.binding == rt
 	s.mu.Unlock()
 	require.True(t, bound, "the tail runs before the binding is cleared")
 	require.False(t, rt.alive(), "a binding whose generation ended routes nothing")
@@ -392,7 +392,7 @@ func TestEndedBindingCannotCancelReplacementPrompt(t *testing.T) {
 	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 	s := a.sessions[created.SessionId]
-	old := s.runtime
+	old := s.binding
 	old.server.mu.Lock()
 	unlock := sync.OnceFunc(old.server.mu.Unlock)
 	defer unlock()
@@ -529,7 +529,7 @@ func TestCloseJoinsFirstMirrorAndFencesOpening(t *testing.T) {
 			s, err := a.session(t.Context(), acp.SessionId(key.SessionID))
 			require.NoError(t, err)
 			s.mu.Lock()
-			rt := s.runtime
+			rt := s.binding
 			s.mu.Unlock()
 			closed := make(chan error, 1)
 			go func() {
@@ -589,7 +589,7 @@ func TestOpeningRejectsReplacedNativeGeneration(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	stale := s.runtime
+	stale := s.binding
 	s.mu.Unlock()
 	transport, meta := prepareOpeningResponse(t)
 	a.attach(rec, transport)
@@ -749,7 +749,7 @@ func TestBackgroundPublicationAllowsCancelCallback(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	a.attach(&cancellingBackgroundClient{recorder: rec, agent: a}, nil)
 	s.openAgentCycle(t.Context(), rt)
@@ -777,7 +777,7 @@ func TestCancelAgentOriginResolvesDialogsAndSettlesCancelled(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	s.openAgentCycle(t.Context(), rt)
 	s.mu.Lock()
@@ -833,7 +833,7 @@ func TestTerminalPublicationCannotInterruptNextCycle(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	terminalClient := &cancellingBackgroundClient{recorder: rec, agent: a, terminalOnly: true}
 	a.attach(terminalClient, nil)
@@ -877,7 +877,7 @@ func TestCloseCommitsAnAgentCycleBeforeTerminalizing(t *testing.T) {
 			require.NoError(t, err)
 
 			s.mu.Lock()
-			rt := s.runtime
+			rt := s.binding
 			s.mu.Unlock()
 
 			require.NoError(t, s.commitMirror(t.Context(), rt, nil), "a first mirror makes the session persisted")

@@ -25,7 +25,7 @@ func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
 			response, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "HELLO"))
 			require.NoError(t, err)
 			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
-			rt := s.runtime
+			rt := s.binding
 			native := *rt.client
 			exported, err := native.Export(t.Context(), s.nativeID)
 			require.NoError(t, err)

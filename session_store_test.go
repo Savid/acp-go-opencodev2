@@ -97,7 +97,7 @@ func TestMirrorRefusesWhileChildSessionRuns(t *testing.T) {
 	s, err := a.session(t.Context(), created.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	var child = createNativeChild(t, rt, s.nativeID, cwd)
 
@@ -153,7 +153,7 @@ func TestMirrorIncludesDescendantsAndExcludesUnrelatedSessions(t *testing.T) {
 	s, err := a.session(t.Context(), root.SessionId)
 	require.NoError(t, err)
 	s.mu.Lock()
-	rt := s.runtime
+	rt := s.binding
 	s.mu.Unlock()
 	parent := s.nativeID
 	want := make([]string, 1, 3)
