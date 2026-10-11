@@ -69,6 +69,18 @@ func (s *nativeFixtureStore) Replace(ctx context.Context, key acpcore.SessionKey
 	return nil
 }
 
+func (s *nativeFixtureStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("fixture mirror failure")
+	}
+	if err := s.SessionStore.Append(ctx, key, base, entries, replacements); err != nil {
+		return err
+	}
+	s.trace.add("commit")
+
+	return nil
+}
+
 type nativeFixtureRecorder struct {
 	*recorder
 	trace *traceLog
@@ -116,8 +128,8 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			data = []byte(strings.ReplaceAll(string(data), "fixture-session", string(s.id)))
 			var frames []json.RawMessage
 			require.NoError(t, json.Unmarshal(data, &frames))
-			var terminal opencode.Event
-			require.NoError(t, json.Unmarshal(frames[len(frames)-1], &terminal))
+			terminal, err := opencode.DecodeEvent(frames[len(frames)-1])
+			require.NoError(t, err)
 			native, err := rt.client.Export(t.Context(), s.nativeID)
 			require.NoError(t, err)
 			marker := opencode.NativeMessage{ID: strings.Replace(terminal.ID, "evt_", "msg_", 1), Type: "idle", Outcome: "succeeded"}
@@ -139,8 +151,8 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 			trace.reset()
 			store.fail.Store(failCommit)
 			for _, frame := range frames {
-				var envelope opencode.Event
-				require.NoError(t, json.Unmarshal(frame, &envelope))
+				envelope, decodeErr := opencode.DecodeEvent(frame)
+				require.NoError(t, decodeErr)
 				rt.events <- envelope
 			}
 			require.Eventually(t, func() bool {
@@ -255,6 +267,28 @@ func TestToolInputArrivesAfterPending(t *testing.T) {
 	}
 	require.Equal(t, 1, started)
 	require.Equal(t, []any{"pwd", "pwd"}, inputs)
+}
+
+func TestIncompleteToolInputFailsTheCall(t *testing.T) {
+	rec := newRecorder()
+	a := NewAgent()
+	t.Cleanup(func() { _ = a.Close() })
+	a.attach(rec, nil)
+	s := &session{agent: a, id: "tool-session"}
+	c := &cycle{}
+	c.state.init()
+	require.NoError(t, s.projectEvent(t.Context(), c, opencode.Event{Type: "session.tool.input.started"}, eventData{ID: "call", Name: "shell"}))
+	incomplete := &opencode.NativeError{Type: "tool.input-incomplete", Message: "Tool call arguments were not completed and were not executed."}
+	require.NoError(t, s.projectEvent(t.Context(), c, opencode.Event{Type: eventToolFailed}, eventData{ID: "call", Error: incomplete}))
+	var last *acp.SessionToolCallUpdate
+	for _, n := range rec.snapshot() {
+		if n.Update.ToolCallUpdate != nil {
+			last = n.Update.ToolCallUpdate
+		}
+	}
+	require.NotNil(t, last)
+	require.Equal(t, acp.ToolCallStatusFailed, *last.Status)
+	require.Equal(t, incomplete.Message, last.Content[len(last.Content)-1].Content.Content.Text.Text)
 }
 
 // fakeContextWindow is the fake catalog's context window for the session's
@@ -410,54 +444,26 @@ func TestFailedCompactionCountsConsumption(t *testing.T) {
 	require.Empty(t, usageUpdates(h.rec.snapshot()))
 }
 
-func TestCancelDuringUsageCostRead(t *testing.T) {
+func TestUsageCostAccumulatesFromNativeEvents(t *testing.T) {
 	t.Parallel()
 	a, s, _ := newDirectSession(t)
 	rec := newRecorder()
 	a.attach(rec, nil)
 	rt := s.binding
-	target, err := url.Parse(rt.client.URL)
-	require.NoError(t, err)
-	forward := httputil.NewSingleHostReverseProxy(target)
-	entered, release := make(chan struct{}), make(chan struct{})
-	unblock := sync.OnceFunc(func() { close(release) })
-	var once sync.Once
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == opencode.SessionPath(s.nativeID) {
-			once.Do(func() {
-				close(entered)
-				select {
-				case <-release:
-				case <-r.Context().Done():
-				}
-			})
-		}
-		forward.ServeHTTP(w, r)
-	}))
-	defer proxy.Close()
-	defer unblock()
-	client := opencode.NewClient()
-	client.URL, client.Password = proxy.URL, rt.client.Password
-	rt.client = client
-	done := make(chan error, 1)
-	go func() {
-		_, promptErr := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "hello"))
-		done <- promptErr
-	}()
-	select {
-	case <-entered:
-	case <-time.After(testTimeout):
-		t.Fatal("usage cost read did not start")
+	s.mu.Lock()
+	s.cost = 1.5
+	s.mu.Unlock()
+	event := func(kind, data string) opencode.Event {
+		return opencode.Event{ID: opencode.NewID("evt_"), Type: kind, SessionID: s.nativeID, Data: json.RawMessage(data)}
 	}
-	require.NoError(t, a.Cancel(t.Context(), wire.CancelRequest(s.id)))
-	unblock()
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(testTimeout):
-		t.Fatal("cancelled prompt did not finish")
-	}
-	require.Empty(t, usageUpdates(rec.snapshot()))
+	s.handleEvent(t.Context(), rt, event(eventUsageRecorded, `{"source":"title","cost":0.25}`))
+	s.handleEvent(t.Context(), rt, event("session.step.ended", `{"assistantMessageID":"msg_other","cost":0.5}`))
+	s.handleEvent(t.Context(), rt, event("session.step.failed", `{"assistantMessageID":"msg_failed"}`))
+	require.NoError(t, s.emitResponseUsage(t.Context(), &cycle{}, opencode.NativeMessage{ID: "msg_call", Tokens: fakeTokens(1, 0, 1)}))
+	reports := usageUpdates(rec.snapshot())
+	require.Len(t, reports, 1)
+	require.InDelta(t, 2.25, reports[0].Cost.Amount, 1e-9)
+	require.Equal(t, "USD", reports[0].Cost.Currency)
 }
 
 // responseChunk is one agent message or thought chunk as a client sees it.

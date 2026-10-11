@@ -351,3 +351,70 @@ func copyGeneration(t *testing.T, generation map[string][]acpcore.SessionStoreEn
 
 	return store
 }
+
+// storedMessages groups a stored main record's message rows by the session
+// row that precedes them.
+func storedMessages(t *testing.T, rows []acpcore.SessionStoreEntry) map[string][]opencode.Message {
+	t.Helper()
+	sessions := map[string][]opencode.Message{}
+	current := ""
+	for _, row := range rows {
+		var marker struct {
+			SessionID string `json:"sessionId"`
+			Type      string `json:"type"`
+		}
+		require.NoError(t, json.Unmarshal(row, &marker))
+		if marker.Type == "" {
+			current = marker.SessionID
+
+			continue
+		}
+		require.NotEmpty(t, current)
+		message, err := opencode.ParseMessage(json.RawMessage(row))
+		require.NoError(t, err)
+		sessions[current] = append(sessions[current], message)
+	}
+
+	return sessions
+}
+
+// localToolModel is a local provider that asks for one shell call per prompt
+// and answers once the call's result arrives.
+func localToolModel(t *testing.T, command string) string {
+	t.Helper()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role string `json:"role"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		send := func(delta map[string]any, stop any) {
+			data, _ := json.Marshal(map[string]any{"id": "local-response", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": "probe", "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": stop}}})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		}
+		if len(body.Messages) > 0 && body.Messages[len(body.Messages)-1].Role == "tool" {
+			send(map[string]any{"role": "assistant", "content": "done"}, nil)
+			send(map[string]any{}, "stop")
+		} else {
+			arguments, _ := json.Marshal(map[string]string{"command": command})
+			send(map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"index": 0, "id": "call_" + opencode.NewID(""), "type": "function", "function": map[string]any{"name": "shell", "arguments": string(arguments)}}}}, nil)
+			send(map[string]any{}, "tool_calls")
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(provider.Close)
+	config, err := json.Marshal(map[string]any{"providers": map[string]any{"probe": map[string]any{
+		"package":  "@opencode/ai/providers/openai-compatible",
+		"settings": map[string]any{"baseURL": provider.URL + "/v1", "apiKey": "local-probe"},
+		"models":   map[string]any{"probe": map[string]any{"name": "Probe", "limit": map[string]any{"context": 32000, "output": 2000}, "capabilities": map[string]any{"tools": true, "input": []string{"text"}, "output": []string{"text"}}}},
+	}}})
+	require.NoError(t, err)
+
+	return string(config)
+}

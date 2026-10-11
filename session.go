@@ -2,6 +2,7 @@ package opencodeacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
@@ -37,14 +39,22 @@ type session struct {
 	effort                string
 	models                []opencode.Model
 	artifacts             map[string]imageArtifact
-	pendingInputs         map[string][]opencode.InboxInput
+	// imagesWalked holds the root messages whose images were captured.
+	imagesWalked  map[string]struct{}
+	pendingInputs map[string][]opencode.InboxInput
+	// nativeInfos is the native information of the graph last read, parent first.
+	nativeInfos []json.RawMessage
+	// mirror publishes the session's store generation; mirrorMu serializes it.
+	mirror *sessionlog.Mirror
 	// nativeMessages holds model identities for streamed response usage.
 	nativeMessages map[string]opencode.NativeMessage
 	mode           string
 	agents         []opencode.NativeAgent
 	commands       []opencode.NativeCommand
 	title          string
-	updatedAt      string
+	// cost is the native session's cumulative cost in USD.
+	cost      float64
+	updatedAt string
 	// persisted marks a successfully committed mirror.
 	persisted bool
 	// ephemeral marks a session the host deletes without needing it back: it
@@ -75,6 +85,26 @@ type binding struct {
 	done     chan struct{}
 	events   chan opencode.Event
 	results  chan nativePromptResult
+	endMu    sync.Mutex
+	endErr   error
+}
+
+// end records why the binding ended, keeping the first cause, and ends it.
+func (b *binding) end(cause error) {
+	b.endMu.Lock()
+	if b.endErr == nil {
+		b.endErr = cause
+	}
+	b.endMu.Unlock()
+	b.cancel()
+}
+
+// endCause is why the binding ended, when an explicit cause ended it.
+func (b *binding) endCause() error {
+	b.endMu.Lock()
+	defer b.endMu.Unlock()
+
+	return b.endErr
 }
 
 // alive reports whether this binding still routes native events: its generation
@@ -342,6 +372,14 @@ func (s *session) clearRuntime(rt *binding) {
 }
 
 func (s *session) stopRuntime(_ context.Context, rt *binding) { rt.cancel(); <-rt.done }
+
+// endBinding ends rt for a native protocol fault and logs why; a turn it
+// interrupts reports the same cause.
+func (s *session) endBinding(ctx context.Context, rt *binding, cause error) {
+	s.agent.log.ErrorContext(ctx, "opencode session binding ended",
+		slog.String("session_id", string(s.id)), slog.String("reason", cause.Error()))
+	rt.end(cause)
+}
 
 // rememberMessage stores the latest native info for one message.
 func (s *session) rememberMessage(info opencode.NativeMessage) {

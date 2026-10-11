@@ -499,3 +499,22 @@ func newDirectSession(t *testing.T) (*Agent, *session, string) {
 
 	return a, a.sessions[created.SessionId], cwd
 }
+
+// storedGraph reads exports as the native graph a commit would, recording the
+// session information on s.
+func storedGraph(t *testing.T, s *session, exports ...fakeExport) []nativeSnapshot {
+	t.Helper()
+	graph := make([]nativeSnapshot, len(exports))
+	infos := make([]json.RawMessage, len(exports))
+	for i, item := range exports {
+		raw, err := json.Marshal(item)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(raw, &graph[i].Export))
+		infos[i] = graph[i].InfoRaw
+	}
+	s.mu.Lock()
+	s.nativeInfos = infos
+	s.mu.Unlock()
+
+	return graph
+}

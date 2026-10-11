@@ -152,11 +152,26 @@ func (s *session) outputFile(file opencode.NativeAttachment, used *int64) []acp.
 
 // captureImages admits every image the mirror cannot replay from its own rows
 // through the output gate, which stores the sidecar copy a later replay reads.
-// Only a storable artifact is decoded: a data URL carries its bytes in the
-// mirrored row, so rastering it here would cost a decode on every commit and
-// store nothing.
-func (s *session) captureImages(rows [][]byte) {
-	_ = walkImages(rows, s.nativeID, func(file opencode.NativeAttachment, used *int64) error {
+// Each root message is walked once. Only a storable artifact is decoded: a
+// data URL carries its bytes in the mirrored row, so rastering it here would
+// cost a decode and store nothing.
+func (s *session) captureImages(messages []opencode.Message) {
+	fresh := make([]opencode.Message, 0, len(messages))
+
+	s.mu.Lock()
+	if s.imagesWalked == nil {
+		s.imagesWalked = make(map[string]struct{}, len(messages))
+	}
+
+	for _, message := range messages {
+		if _, walked := s.imagesWalked[message.ID]; !walked {
+			s.imagesWalked[message.ID] = struct{}{}
+			fresh = append(fresh, message)
+		}
+	}
+	s.mu.Unlock()
+
+	_ = walkImages(fresh, func(file opencode.NativeAttachment, used *int64) error {
 		if image.IsImageMIME(file.MIME) && storableArtifact(file) {
 			_ = s.outputFile(file, used)
 		}
@@ -164,10 +179,14 @@ func (s *session) captureImages(rows [][]byte) {
 		return nil
 	})
 }
-func walkImages(rows [][]byte, id string, visit func(opencode.NativeAttachment, *int64) error) error {
-	messages := nativeMessages(rows, id)
+
+func walkImages(messages []opencode.Message, visit func(opencode.NativeAttachment, *int64) error) error {
 	for i := range messages {
-		message := &messages[i]
+		message, err := messages[i].Decode()
+		if err != nil {
+			return err
+		}
+
 		for index, file := range message.Files {
 			file.ID = attachmentID(message.ID, index)
 			if err := visit(file, nil); err != nil {
@@ -219,7 +238,7 @@ func imageReference(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func validateStoredImages(rows [][]byte, record sessionRecord) error {
+func validateStoredImages(messages []opencode.Message, record sessionRecord) error {
 	check := func(file opencode.NativeAttachment) error {
 		if !image.IsImageMIME(file.MIME) || file.Data != "" || strings.HasPrefix(file.URL, "data:") {
 			return nil
@@ -237,5 +256,5 @@ func validateStoredImages(rows [][]byte, record sessionRecord) error {
 		return nil
 	}
 
-	return walkImages(rows, record.NativeSessionID, func(file opencode.NativeAttachment, _ *int64) error { return check(file) })
+	return walkImages(messages, func(file opencode.NativeAttachment, _ *int64) error { return check(file) })
 }

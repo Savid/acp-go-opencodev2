@@ -316,6 +316,10 @@ func (s *session) transportFailure(ctx context.Context, rt *binding, err error) 
 		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: nativeErr.Error(), StatusCode: nativeErr.Status})
 	}
 
+	if err == nil {
+		err = rt.endCause()
+	}
+
 	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.server.proc, "opencode process", err, rt.server.stream.Err))
 }
 

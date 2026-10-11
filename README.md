@@ -63,7 +63,9 @@ Pass `_meta.opencode.options` on new, load, or resume, or use
 | `extraPathDirs` | Absolute directories prepended to the session's PATH in order |
 
 The environment plugin reads the addressed session's metadata through OpenCode's
-API. Child sessions inherit that carrier through their native parent. OpenCode
+API before a session's first tool call and applies it once per session; applying
+a carrier again makes every session read it again. Child sessions inherit that
+carrier through their native parent. OpenCode
 keeps its native authentication and configuration. Nonempty `mcpServers` and
 unknown owned options are invalid parameters.
 
@@ -92,27 +94,33 @@ Optional lifecycle negotiation supplies ordered session and turn updates.
 
 Each model call reports a `usage_update` with its token breakdown when its
 `session.step.ended` event arrives, including the native session’s cumulative
-cost in USD. Agent message and thought chunks carry no
+cost in USD: the cost read when the session was bound plus the cost of each
+later step and native usage record. Agent message and thought chunks carry no
 `messageId`, and the breakdown carries no `responseId`: OpenCode keeps none of
 the gateway's response ids, and its own message and part ids are not response ids.
 
 ### Persistence and runtime
 
-`SessionStoreFormat` is `opencode-session-export-v1`. The main subpath holds native
-session exports for one conversation and its descendants. The `config` sidecar
-holds accepted options, captured local image bytes, and deferred synthetic inbox
-entries. A verified native snapshot commits atomically before terminal idle and
-the prompt response, including on cancellation. The execution’s terminal event
-identifies its durable idle marker in the native export. The root snapshot ends
-at that marker; each descendant ends at its latest idle marker, or has empty
-history if it has not completed an execution. A second graph read verifies the
-retained messages, configuration, and deferred inbox while later execution
-continues. Native cumulative usage and session timestamps retain their values
-at capture time and may include later execution. Commands without execution,
-configuration changes, restore, and close require matching idle graph snapshots.
-Synthetic reminders are restored with their native IDs without starting
-execution. A directory change returns backpressure while native inbox entries
-remain pending.
+`SessionStoreFormat` is `opencode-session-export-v2`. The main subpath holds
+the settled native messages of one conversation and its descendants, each as its
+raw native row, merged by creation time with each session's order kept; a
+`{"sessionId":"..."}` row precedes every run of one session's messages. The
+`config` sidecar holds the native session information of the graph, parent
+first, the title, accepted options, captured local image bytes, and deferred
+synthetic inbox entries.
+
+A commit exports each session in the graph once. The root ends at the
+execution's durable idle marker, named by its terminal event; each descendant
+ends at its latest idle marker, or has empty history before its first completed
+execution. The commit appends only the rows the store does not hold and rewrites
+the configuration only when it changed; a history that no longer extends the
+stored rows republishes the generation. It is durable before terminal idle and
+the prompt response, including on cancellation. Native cumulative usage and
+session timestamps retain their values at capture time and may include later
+execution. Commands without execution, configuration changes, restore, and close
+require the graph to be idle with no pending form or permission. Synthetic
+reminders are restored with their native IDs without starting execution. A
+directory change returns backpressure while native inbox entries remain pending.
 
 Load imports missing sessions through the native import API and replays ACP
 history. Resume imports without replay. Existing native messages must preserve
@@ -123,11 +131,24 @@ histories are refused because the import API cannot replace a session. Local
 image replay remains available after its original file is removed. The default
 store is in memory; supply a durable store to restore across adapter restarts.
 
+Native events reach each session in order. A session that falls behind holds
+the shared event stream rather than losing an event; one whose queue stays full
+for two minutes ends its binding, and its turn fails naming that cause. A native
+protocol fault that ends a binding is logged and reported the same way.
+
 Close releases one session while peers retain the shared server. A server crash
 fails affected work, and the next operation starts a replacement and rebinds the
 addressed session. Delete tombstones the store entry. Native state remains
 available to OpenCode's CLI. A native-home file lock prevents two adapter servers
 from owning the same home concurrently.
+
+### Memory
+
+The adapter passes its environment to OpenCode unchanged. A host bounding the
+native server's memory can set `OPENCODE_DISABLE_FILEWATCHER=1`,
+`OPENCODE_DISABLE_FFF=1`, and `OPENCODE_DISABLE_MODELS_FETCH=1` (the catalog then
+comes from the bundled snapshot and configured providers), and seed
+`"snapshots": false` and `"share": "disabled"` in the native configuration.
 
 ## Development
 

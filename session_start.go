@@ -48,7 +48,7 @@ func (s *session) launch(ctx context.Context) (*binding, error) {
 func (s *session) startFailure(ctx context.Context, err error) error {
 	s.agent.log.ErrorContext(ctx, "opencode session start failed", slog.String("reason", err.Error()))
 
-	return wire.InternalFailure(vendor, internalClassNativeStart)
+	return wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 func (s *session) configureRuntime(ctx context.Context, rt *binding, selection OpenCodeOptions, expectID string) error {
@@ -83,7 +83,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 
 		native, err = rt.client.Session(ctx, expectID)
 		if err != nil {
-			return s.agent.restoreRefused(ctx, s.id, err)
+			return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 	}
 
@@ -120,6 +120,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *binding, selection O
 	}
 
 	s.title = native.Title
+	s.cost = native.Cost
 	s.updatedAt = time.UnixMilli(native.Time.Updated).UTC().Format(time.RFC3339)
 	s.mu.Unlock()
 
@@ -214,6 +215,11 @@ func (s *session) configureEnvironment(ctx context.Context, rt *binding) error {
 		return s.startFailure(ctx, err)
 	}
 
+	// The carrier may have changed, so descendants read it again.
+	if err := opencode.AdvancePluginGeneration(rt.server.root); err != nil {
+		return s.startFailure(ctx, err)
+	}
+
 	return nil
 }
 
@@ -232,7 +238,7 @@ func (s *session) configureLocation(ctx context.Context, rt *binding, native ope
 	if native.Location.Directory != s.cwd {
 		inbox, err := rt.client.Inbox(ctx, native.ID)
 		if err != nil {
-			return opencode.NativeSession{}, s.agent.restoreRefused(ctx, s.id, err)
+			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 
 		if len(inbox) != 0 {
@@ -240,16 +246,16 @@ func (s *session) configureLocation(ctx context.Context, rt *binding, native ope
 		}
 
 		if err = rt.client.Move(ctx, native.ID, s.cwd); err != nil {
-			return opencode.NativeSession{}, s.agent.restoreRefused(ctx, s.id, err)
+			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 
 		native, err = rt.client.Session(ctx, native.ID)
 		if err != nil {
-			return opencode.NativeSession{}, s.agent.restoreRefused(ctx, s.id, err)
+			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 
 		if native.Location.Directory != s.cwd {
-			return opencode.NativeSession{}, s.agent.restoreRefused(ctx, s.id, errors.New("native session directory differs from requested directory"))
+			return opencode.NativeSession{}, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, errors.New("native session directory differs from requested directory"))
 		}
 	}
 

@@ -58,7 +58,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	logger = telemetry.Logger
 
-	ctx, stop := signal.NotifyContext(ctx, forwardedSignals()...)
+	ctx, stop := signal.NotifyContext(ctx, process.ForwardedSignals()...)
 	defer stop()
 
 	options := []opencodeacp.Option{

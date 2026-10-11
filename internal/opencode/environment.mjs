@@ -12,8 +12,21 @@ export default {
     const directory = ctx.location.directory
     mkdirSync(proofRoot, { recursive: true, mode: 0o700 })
     writeFileSync(join(proofRoot, createHash("sha256").update(directory).digest("hex")), directory, { mode: 0o600 })
+    const root = dirname(proofRoot)
+    let endpoint
+    let generation
+    const applied = new Set()
     ctx.tool.hook("execute.before", async ({ sessionID }) => {
-      const endpoint = readFileSync(join(dirname(proofRoot), "endpoint"), "utf8")
+      let current = ""
+      try {
+        current = readFileSync(join(root, "generation"), "utf8")
+      } catch {}
+      if (current !== generation) {
+        generation = current
+        applied.clear()
+      }
+      if (applied.has(sessionID)) return
+      endpoint ??= readFileSync(join(root, "endpoint"), "utf8")
       const headers = {
         Authorization: "Basic " + Buffer.from("opencode:" + process.env.OPENCODE_SERVER_PASSWORD).toString("base64"),
         "Content-Type": "application/json",
@@ -33,7 +46,10 @@ export default {
         }
         id = data.parentID
       }
-      if (!carrier) return
+      if (!carrier) {
+        applied.add(sessionID)
+        return
+      }
       if (!carrier.env || !Array.isArray(carrier.extraPathDirs)) throw Error("session environment missing")
       const variables = { ...process.env }
       for (const [key, value] of Object.entries(carrier.env)) {
@@ -50,6 +66,7 @@ export default {
         method: "PUT", headers, body: JSON.stringify({ variables }), signal: AbortSignal.timeout(10000),
       })
       if (!response.ok) throw Error("session environment update failed")
+      if (current === generation) applied.add(sessionID)
     })
   },
 }

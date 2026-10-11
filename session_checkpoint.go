@@ -7,153 +7,96 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"reflect"
 	"slices"
 	"time"
 
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
 
-const snapshotAttempts = 5
-const snapshotRetryDelay = 100 * time.Millisecond
-
-// readNativeRows verifies completed exports against a second read. Without an
-// execution boundary, the entire graph must be idle and unchanged.
-func (s *session) readNativeRows(ctx context.Context, rt *binding, terminal *opencode.Event) ([][]byte, error) {
-	var lastErr error
-
-	for range snapshotAttempts {
-		first, err := s.exportGraph(ctx, rt)
-		if err != nil {
-			return nil, err
-		}
-
-		if terminal == nil {
-			if idleErr := s.requireNativeIdle(ctx, rt, first); idleErr != nil {
-				return nil, idleErr
-			}
-		}
-
-		second, err := s.exportGraph(ctx, rt)
-		if err != nil {
-			return nil, err
-		}
-
-		if terminal != nil {
-			first, err = completedGraph(first, *terminal)
-		}
-
-		verified := false
-
-		if err == nil {
-			if normalizeErr := normalizeInputs(first); normalizeErr != nil {
-				return nil, normalizeErr
-			}
-
-			if normalizeErr := normalizeInputs(second); normalizeErr != nil {
-				return nil, normalizeErr
-			}
-
-			verified = reflect.DeepEqual(first, second)
-			if terminal != nil {
-				verified, err = snapshotRetained(first, second)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-
-		if verified {
-			if terminal == nil {
-				if idleErr := s.requireNativeIdle(ctx, rt, second); idleErr != nil {
-					return nil, idleErr
-				}
-			}
-
-			inputs := make(map[string][]opencode.InboxInput)
-
-			rows := make([][]byte, 0, len(first))
-			for i := range first {
-				item := &first[i]
-
-				rows = append(rows, append([]byte(nil), item.Raw...))
-				if len(item.Inbox) > 0 {
-					inputs[item.Info.ID] = item.Inbox
-				}
-			}
-
-			s.mu.Lock()
-			s.pendingInputs = inputs
-			s.mu.Unlock()
-
-			return rows, nil
-		}
-
-		lastErr = err
-		if lastErr == nil {
-			lastErr = errors.New("native session graph, retained messages, or configuration changed")
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(snapshotRetryDelay):
-		}
-	}
-
-	return nil, fmt.Errorf("native history did not yield a verified snapshot after %d attempts: %w", snapshotAttempts, lastErr)
-}
-
-// completedGraph fixes the root at its observed terminal event and each child
-// at its latest completed execution. A child with no terminal has empty history.
-func completedGraph(graph []nativeSnapshot, terminal opencode.Event) ([]nativeSnapshot, error) {
-	for i := range graph {
-		var err error
-		if i == 0 {
-			graph[i].Export, err = graph[i].ExecutionPrefix(terminal)
-		} else {
-			graph[i].Export, err = graph[i].CompletedPrefix()
-		}
-
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return graph, nil
-}
-
-// snapshotRetained allows later executions and newly exportable completed rows
-// while requiring every captured message and deferred input to remain intact.
-func snapshotRetained(first, second []nativeSnapshot) (bool, error) {
-	current := make(map[string]*nativeSnapshot, len(second))
-	for i := range second {
-		current[second[i].Info.ID] = &second[i]
-	}
-
-	for i := range first {
-		item := &first[i]
-
-		later, ok := current[item.Info.ID]
-		if !ok || !later.ContainsHistory(item.Export) || !item.SameConfiguration(later.Export) {
-			return false, nil
-		}
-
-		if err := verifyPendingInputs(item.Inbox, later.Inbox, later.Messages); err != nil {
-			// A new first read could forget an input that disappeared without delivery.
-			return false, err
-		}
-	}
-
-	return true, nil
-}
+// markerAttempts bounds how long a commit waits for an execution's durable
+// idle marker to become visible in the native export after its terminal event.
+const markerAttempts = 5
+const markerRetryDelay = 100 * time.Millisecond
 
 type nativeSnapshot struct {
 	opencode.Export
 	Inbox []opencode.InboxInput
 }
 
-func (s *session) exportGraph(ctx context.Context, rt *binding) ([]nativeSnapshot, error) {
+// readGraph exports the native session graph once. With a terminal event the
+// root ends at that execution's idle marker and each descendant at its latest
+// one; without it the whole graph must be idle around the read.
+func (s *session) readGraph(ctx context.Context, rt *binding, terminal *opencode.Event) ([]nativeSnapshot, error) {
+	for attempt := 1; ; attempt++ {
+		graph, err := s.exportGraph(ctx, rt, terminal)
+		if !errors.Is(err, opencode.ErrMarkerMissing) || attempt == markerAttempts {
+			if err != nil {
+				return nil, fmt.Errorf("native history snapshot: %w", err)
+			}
+
+			return graph, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(markerRetryDelay):
+		}
+	}
+}
+
+func (s *session) exportGraph(ctx context.Context, rt *binding, terminal *opencode.Event) ([]nativeSnapshot, error) {
+	if terminal == nil {
+		if err := requireInactive(ctx, rt, []string{s.nativeID}); err != nil {
+			return nil, err
+		}
+	}
+
+	graph, err := s.readExports(ctx, rt)
+	if err != nil {
+		return nil, err
+	}
+
+	if terminal != nil {
+		if graph[0].Export, err = graph[0].ExecutionPrefix(*terminal); err != nil {
+			return nil, err
+		}
+
+		for i := 1; i < len(graph); i++ {
+			graph[i].Export = graph[i].CompletedPrefix()
+		}
+	} else if idleErr := requireNativeIdle(ctx, rt, graph); idleErr != nil {
+		return nil, idleErr
+	}
+
+	inputs := make(map[string][]opencode.InboxInput)
+	infos := make([]json.RawMessage, len(graph))
+
+	for i := range graph {
+		item := &graph[i]
+
+		item.Inbox, err = undeliveredInputs(item.Inbox, item.Messages)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(item.Inbox) > 0 {
+			inputs[item.Info.ID] = item.Inbox
+		}
+
+		infos[i] = item.InfoRaw
+	}
+
+	s.mu.Lock()
+	s.pendingInputs = inputs
+	s.nativeInfos = infos
+	s.mu.Unlock()
+
+	return graph, nil
+}
+
+// readExports reads the root and every descendant, parent first.
+func (s *session) readExports(ctx context.Context, rt *binding) ([]nativeSnapshot, error) {
 	var exports []nativeSnapshot
 
 	pending := []string{s.nativeID}
@@ -180,6 +123,10 @@ func (s *session) exportGraph(ctx context.Context, rt *binding) ([]nativeSnapsho
 			return nil, err
 		}
 
+		if item.Info.ID != id {
+			return nil, errors.New("native export identity changed")
+		}
+
 		exports = append(exports, nativeSnapshot{Export: item, Inbox: inbox})
 		cursor := ""
 
@@ -201,8 +148,7 @@ func (s *session) exportGraph(ctx context.Context, rt *binding) ([]nativeSnapsho
 			}
 
 			for i := range children.Data {
-				child := &children.Data[i]
-				pending = append(pending, child.ID)
+				pending = append(pending, children.Data[i].ID)
 			}
 
 			if children.Cursor.Next == "" {
@@ -220,7 +166,7 @@ func (s *session) exportGraph(ctx context.Context, rt *binding) ([]nativeSnapsho
 	return exports, nil
 }
 
-func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph []nativeSnapshot) error {
+func requireInactive(ctx context.Context, rt *binding, ids []string) error {
 	var active struct {
 		Data map[string]opencode.NativeSessionStatus `json:"data"`
 	}
@@ -228,17 +174,31 @@ func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph []na
 		return err
 	}
 
-	for i := range graph {
-		item := &graph[i]
-		if _, ok := active.Data[item.Info.ID]; ok {
+	for _, id := range ids {
+		if _, ok := active.Data[id]; ok {
 			return errors.New("native session is still running")
 		}
+	}
 
+	return nil
+}
+
+func requireNativeIdle(ctx context.Context, rt *binding, graph []nativeSnapshot) error {
+	ids := make([]string, len(graph))
+	for i := range graph {
+		ids[i] = graph[i].Info.ID
+	}
+
+	if err := requireInactive(ctx, rt, ids); err != nil {
+		return err
+	}
+
+	for _, id := range ids {
 		for _, suffix := range []string{"/form", "/permission"} {
 			var pending struct {
 				Data []json.RawMessage `json:"data"`
 			}
-			if err := rt.client.Do(ctx, "", http.MethodGet, opencode.SessionPath(item.Info.ID)+suffix, nil, &pending); err != nil {
+			if err := rt.client.Do(ctx, "", http.MethodGet, opencode.SessionPath(id)+suffix, nil, &pending); err != nil {
 				return err
 			}
 
@@ -251,25 +211,12 @@ func (s *session) requireNativeIdle(ctx context.Context, rt *binding, graph []na
 	return nil
 }
 
-func normalizeInputs(graph []nativeSnapshot) error {
-	for i := range graph {
-		inputs, err := undeliveredInputs(graph[i].Inbox, graph[i].Messages)
-		if err != nil {
-			return err
-		}
-
-		graph[i].Inbox = inputs
-	}
-
-	return nil
-}
-
 // undeliveredInputs excludes inputs the export already contains as messages.
-func undeliveredInputs(inputs []opencode.InboxInput, messages []opencode.NativeMessage) ([]opencode.InboxInput, error) {
+func undeliveredInputs(inputs []opencode.InboxInput, messages []opencode.Message) ([]opencode.InboxInput, error) {
 	var pending []opencode.InboxInput
 
 	for _, input := range inputs {
-		index := slices.IndexFunc(messages, func(message opencode.NativeMessage) bool { return message.ID == input.ID })
+		index := slices.IndexFunc(messages, func(message opencode.Message) bool { return message.ID == input.ID })
 		if index < 0 {
 			pending = append(pending, input)
 
@@ -282,4 +229,57 @@ func undeliveredInputs(inputs []opencode.InboxInput, messages []opencode.NativeM
 	}
 
 	return pending, nil
+}
+
+// graphRows lays the graph's messages out as mirror rows: each message's raw
+// native bytes, merged across sessions by creation time with each session's
+// own order kept, and a session row before every run of one session's
+// messages. Later commits add messages created later, so the layout of a
+// longer history extends the rows committed before it.
+func graphRows(graph []nativeSnapshot) [][]byte {
+	total := 0
+	for i := range graph {
+		total += len(graph[i].Messages)
+	}
+
+	rows := make([][]byte, 0, total+len(graph))
+	next := make([]int, len(graph))
+	current := -1
+
+	for range total {
+		pick, created := -1, int64(0)
+
+		for i := range graph {
+			messages := graph[i].Messages
+			if next[i] < len(messages) && (pick < 0 || messages[next[i]].Created < created) {
+				pick, created = i, messages[next[i]].Created
+			}
+		}
+
+		if pick != current {
+			rows = append(rows, sessionRow(graph[pick].Info.ID))
+			current = pick
+		}
+
+		rows = append(rows, graph[pick].Messages[next[pick]].Raw)
+		next[pick]++
+	}
+
+	return rows
+}
+
+// storedRow is a mirror row: a session row names the session whose messages
+// follow; any other row is a native message.
+type storedRow struct {
+	SessionID string `json:"sessionId"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+}
+
+func sessionRow(id string) []byte {
+	row, _ := json.Marshal(struct {
+		SessionID string `json:"sessionId"`
+	}{id})
+
+	return row
 }

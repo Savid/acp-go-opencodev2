@@ -11,7 +11,7 @@ import (
 func checkpointExport(t *testing.T, messages string) Export {
 	t.Helper()
 	var value Export
-	require.NoError(t, json.Unmarshal([]byte(`{"info":{"id":"ses_root","time":{"created":1}},"messages":[`+messages+`],"extension":{"number":9007199254740993}}`), &value))
+	require.NoError(t, json.Unmarshal([]byte(`{"info":{"id":"ses_root","time":{"created":1}},"messages":[`+messages+`]}`), &value))
 
 	return value
 }
@@ -20,34 +20,51 @@ func TestExecutionPrefix(t *testing.T) {
 	t.Parallel()
 	const saved = `{"id":"msg_user","type":"user","text":"hello","unknown":9007199254740993}, {"id":"msg_done","type":"idle","outcome":"interrupted"}`
 	value := checkpointExport(t, saved+`, {"id":"msg_later","type":"user","text":"next"}`)
-	event := Event{ID: "evt_done", Type: "session.execution.interrupted", Data: json.RawMessage(`{"sessionID":"ses_root"}`)}
+	event := Event{ID: "evt_done", Type: "session.execution.interrupted", SessionID: "ses_root"}
 	prefix, err := value.ExecutionPrefix(event)
 	require.NoError(t, err)
 	require.Len(t, prefix.Messages, 2)
-	require.Equal(t, value.Messages[0].Raw, prefix.Messages[0].Raw)
+	require.JSONEq(t, `{"id":"msg_user","type":"user","text":"hello","unknown":9007199254740993}`, string(prefix.Messages[0].Raw))
+	require.Contains(t, string(prefix.Messages[0].Raw), `"unknown":9007199254740993`)
 	require.Equal(t, value.Messages[1].Raw, prefix.Messages[1].Raw)
-	require.Contains(t, string(prefix.Raw), `"unknown":9007199254740993`)
-	require.Contains(t, string(prefix.Raw), `"extension":{"number":9007199254740993}`)
-	require.NotContains(t, string(prefix.Raw), "msg_later")
+	encoded, err := json.Marshal(prefix)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "msg_later")
 	var decoded Export
-	require.NoError(t, json.Unmarshal(prefix.Raw, &decoded))
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
 	require.Len(t, decoded.Messages, 2)
+	require.Equal(t, "ses_root", decoded.Info.ID)
 	for _, invalid := range []Event{
-		{ID: "evt_missing", Type: event.Type, Data: event.Data},
-		{ID: event.ID, Type: "session.execution.succeeded", Data: event.Data},
-		{ID: event.ID, Type: event.Type, Data: json.RawMessage(`{"sessionID":"ses_other"}`)},
-		{ID: "done", Type: event.Type, Data: event.Data},
+		{ID: "evt_missing", Type: event.Type, SessionID: event.SessionID},
+		{ID: event.ID, Type: "session.execution.succeeded", SessionID: event.SessionID},
+		{ID: event.ID, Type: event.Type, SessionID: "ses_other"},
+		{ID: "done", Type: event.Type, SessionID: event.SessionID},
 	} {
 		_, err = value.ExecutionPrefix(invalid)
 		require.Error(t, err)
 	}
-	child, err := value.CompletedPrefix()
-	require.NoError(t, err)
-	require.Equal(t, prefix.Raw, child.Raw)
-	child, err = checkpointExport(t, `{"id":"msg_first","type":"user"}`).CompletedPrefix()
-	require.NoError(t, err)
+	_, err = value.ExecutionPrefix(Event{ID: "evt_missing", Type: event.Type, SessionID: event.SessionID})
+	require.ErrorIs(t, err, ErrMarkerMissing)
+	require.Equal(t, prefix.Messages, value.CompletedPrefix().Messages)
+	child := checkpointExport(t, `{"id":"msg_first","type":"user"}`).CompletedPrefix()
 	require.Empty(t, child.Messages)
-	require.Contains(t, string(child.Raw), `"messages":[]`)
+	encoded, err = json.Marshal(child)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"messages":[]`)
+}
+
+func TestDecodeEvent(t *testing.T) {
+	t.Parallel()
+	frame := []byte(`{"id":"evt_1","type":"form.created","data":{"form":{"sessionID":"ses_form"}}}`)
+	event, err := DecodeEvent(frame)
+	require.NoError(t, err)
+	require.Equal(t, "ses_form", event.SessionID)
+	require.Equal(t, frame, []byte(event.Raw))
+	event, err = DecodeEvent([]byte(`{"id":"evt_2","type":"session.text.delta","data":{"sessionID":"ses_text"}}`))
+	require.NoError(t, err)
+	require.Equal(t, "ses_text", event.SessionID)
+	_, err = DecodeEvent([]byte(`{`))
+	require.Error(t, err)
 }
 
 func TestContainsHistory(t *testing.T) {

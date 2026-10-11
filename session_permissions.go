@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -29,7 +30,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 
 	if event.Type == eventPermissionAsked {
 		if json.Unmarshal(event.Data, &permission) != nil {
-			rt.cancel()
+			s.endBinding(ctx, rt, errors.New("opencode sent an unreadable permission request"))
 
 			return
 		}
@@ -37,7 +38,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 		id = permission.ID
 	} else {
 		if json.Unmarshal(event.Data, &formEvent) != nil {
-			rt.cancel()
+			s.endBinding(ctx, rt, errors.New("opencode sent an unreadable form"))
 
 			return
 		}
@@ -46,7 +47,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 	}
 
 	if id == "" {
-		rt.cancel()
+		s.endBinding(ctx, rt, errors.New("opencode sent a dialog without an identity"))
 
 		return
 	}
@@ -96,7 +97,7 @@ func (s *session) handleControl(ctx context.Context, rt *binding, c *cycle, even
 		defer replyCancel()
 
 		if err := rt.client.Do(replyCtx, "", method, path, body, nil); err != nil && !opencode.IsMissing(err) {
-			rt.cancel()
+			s.endBinding(ctx, rt, fmt.Errorf("opencode dialog reply failed: %w", err))
 		}
 	}()
 }

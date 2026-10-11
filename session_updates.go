@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -40,6 +41,9 @@ const (
 	partFile                  = "file"
 	partTool                  = "tool"
 	partReasoning             = "reasoning"
+	eventUsageRecorded        = "session.usage.recorded"
+	eventStepEnded            = "session.step.ended"
+	eventStepFailed           = "session.step.failed"
 	eventPermissionAsked      = "permission.asked"
 	eventFormCreated          = "form.created"
 	approvalReject            = "reject"
@@ -49,7 +53,7 @@ const (
 )
 
 type cycleState struct {
-	text          map[string]string
+	text          wire.StreamedText
 	tools         map[string]bool
 	terminalTools map[string]bool
 	toolNames     map[string]string
@@ -63,11 +67,10 @@ type cycleState struct {
 }
 
 func (state *cycleState) init() {
-	if state.text != nil {
+	if state.tools != nil {
 		return
 	}
 
-	state.text = map[string]string{}
 	state.tools = map[string]bool{}
 	state.terminalTools = map[string]bool{}
 	state.toolNames = map[string]string{}
@@ -122,28 +125,19 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 	s.emitRawEvent(ctx, event)
 
 	switch event.Type {
-	case "session.deleted", "todo.updated", "session.inbox.enqueued", eventExecutionStarted, "session.execution.succeeded", eventExecutionFailed, eventExecutionInterrupted, "session.step.started", "session.step.ended", "session.step.failed", "session.text.delta", eventReasoningDelta, "session.text.ended", eventReasoningEnded, "session.tool.input.started", "session.tool.called", "session.tool.success", eventToolFailed, eventCompactionStarted, eventCompactionEnded, eventCompactionFailed, eventPermissionAsked, eventFormCreated:
+	case "session.deleted", "todo.updated", "session.inbox.enqueued", eventExecutionStarted, "session.execution.succeeded", eventExecutionFailed, eventExecutionInterrupted, "session.step.started", eventStepEnded, eventStepFailed, "session.text.delta", eventReasoningDelta, "session.text.ended", eventReasoningEnded, "session.tool.input.started", "session.tool.called", "session.tool.success", eventToolFailed, eventCompactionStarted, eventCompactionEnded, eventCompactionFailed, eventPermissionAsked, eventFormCreated, eventUsageRecorded:
 	default:
 		return
 	}
 
 	var data eventData
-	if json.Unmarshal(event.Data, &data) != nil {
-		rt.cancel()
+	if err := json.Unmarshal(event.Data, &data); err != nil {
+		s.endBinding(ctx, rt, fmt.Errorf("opencode sent an unreadable %s event: %w", event.Type, err))
 
 		return
 	}
 
-	if event.Type == eventExecutionInterrupted && data.Reason == "shutdown" {
-		rt.cancel()
-
-		return
-	}
-
-	if event.Type == "session.deleted" {
-		s.poisonSession(ctx, "native_session_identity_drift")
-		rt.cancel()
-
+	if s.observeSession(ctx, rt, event, data) {
 		return
 	}
 
@@ -223,6 +217,33 @@ func (s *session) handleEvent(ctx context.Context, rt *binding, event opencode.E
 		s.settleAgentCycle(ctx, rt, c)
 	}
 }
+
+// observeSession applies the events that concern the session rather than a
+// foreground cycle and reports whether the event is fully handled.
+func (s *session) observeSession(ctx context.Context, rt *binding, event opencode.Event, data eventData) bool {
+	switch event.Type {
+	case eventExecutionInterrupted:
+		if data.Reason == "shutdown" {
+			s.endBinding(ctx, rt, errors.New("opencode interrupted the execution for shutdown"))
+
+			return true
+		}
+	case "session.deleted":
+		s.poisonSession(ctx, wire.CauseNativeSessionIdentityDrift)
+		s.endBinding(ctx, rt, errors.New("opencode deleted the native session"))
+
+		return true
+	case eventStepEnded, eventStepFailed:
+		s.addCost(data.Cost)
+	case eventUsageRecorded:
+		s.addCost(data.Cost)
+
+		return true
+	}
+
+	return false
+}
+
 func (s *session) projectEvent(ctx context.Context, c *cycle, event opencode.Event, data eventData) error {
 	state := &c.state
 
@@ -237,14 +258,18 @@ func (s *session) projectEvent(ctx context.Context, c *cycle, event opencode.Eve
 	case "session.step.started":
 		s.rememberMessage(opencode.NativeMessage{ID: data.AssistantMessageID, Type: roleAssistant, Model: data.Model})
 	case "session.text.delta", eventReasoningDelta:
-		state.text[key] += data.Delta
+		state.text.Add(key, data.Delta)
+
 		if event.Type == eventReasoningDelta {
 			return s.emit(ctx, acp.UpdateAgentThoughtText(data.Delta))
 		}
 
 		return s.emit(ctx, acp.UpdateAgentMessageText(data.Delta))
 	case "session.text.ended", eventReasoningEnded:
-		return s.emitText(ctx, state, key, data.Text, event.Type == eventReasoningEnded)
+		err := s.emitText(ctx, state, key, data.Text, event.Type == eventReasoningEnded)
+		state.text.Forget(key)
+
+		return err
 	case "session.tool.input.started":
 		state.toolNames[data.ID] = data.Name
 
@@ -260,7 +285,7 @@ func (s *session) projectEvent(ctx context.Context, c *cycle, event opencode.Eve
 		}
 
 		return s.emitTool(ctx, state, data.ID, state.toolNames[data.ID], opencode.ToolState{Status: status, Input: state.toolInputs[data.ID], Content: data.Content, Error: data.Error})
-	case "session.step.ended", "session.step.failed":
+	case eventStepEnded, eventStepFailed:
 		message := s.nativeMessage(data.AssistantMessageID)
 		message.Tokens = data.Tokens
 		message.Cost = data.Cost
@@ -284,13 +309,7 @@ func (s *session) projectEvent(ctx context.Context, c *cycle, event opencode.Eve
 func (s *session) emitText(ctx context.Context, state *cycleState, key, text string, thought bool) error {
 	state.init()
 
-	suffix, ok := strings.CutPrefix(text, state.text[key])
-	if !ok {
-		return errors.New("native text changed after publication")
-	}
-
-	state.text[key] = text
-
+	suffix := state.text.Suffix(key, text)
 	if suffix == "" {
 		return nil
 	}
@@ -326,23 +345,12 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, message openc
 	}
 
 	c.state.usage = addUsage(c.state.usage, message.Tokens)
-	update := acp.SessionUsageUpdate{Used: contextTokens(message.Tokens), Size: s.knownContextWindow(message.Model.ProviderID, message.Model.ID)}
+
 	s.mu.Lock()
-	rt := s.binding
+	cost := s.cost
 	s.mu.Unlock()
 
-	if rt != nil {
-		readCtx, cancel := context.WithTimeout(ctx, serverHealthTimeout)
-		defer cancel()
-
-		native, err := rt.client.Session(readCtx, s.nativeID)
-		if err != nil {
-			return s.transportFailure(ctx, rt, err)
-		}
-
-		update.Cost = &acp.Cost{Amount: native.Cost, Currency: "USD"}
-	}
-
+	update := acp.SessionUsageUpdate{Used: contextTokens(message.Tokens), Size: s.knownContextWindow(message.Model.ProviderID, message.Model.ID), Cost: &acp.Cost{Amount: cost, Currency: "USD"}}
 	update.Meta = call.Apply(nil)
 
 	if s.cycleCancelled(c) {
@@ -351,6 +359,15 @@ func (s *session) emitResponseUsage(ctx context.Context, c *cycle, message openc
 
 	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &update})
 }
+
+// addCost tracks the native session's cumulative cost from the usage events
+// the native projector adds to it, so a usage update needs no native read.
+func (s *session) addCost(cost float64) {
+	s.mu.Lock()
+	s.cost += cost
+	s.mu.Unlock()
+}
+
 func addUsage(total *acp.Usage, tokens opencode.NativeTokens) *acp.Usage {
 	if total == nil {
 		total = &acp.Usage{CachedReadTokens: new(0), CachedWriteTokens: new(0), ThoughtTokens: new(0)}
@@ -605,7 +622,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *binding, c *cycle) {
 		// A fenced incarnation is terminal, so the binding ends with it and the
 		// next operation relaunches and opens a new one. This runs on the
 		// binding's own pump, which joins itself, so the cancel is the drop.
-		rt.cancel()
+		rt.end(errors.New("session mirror commit failed"))
 	}
 
 	verdict := judgeCycle(c, s.cycleFailure(c), s.claimCancellation(c))

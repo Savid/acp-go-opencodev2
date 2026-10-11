@@ -87,11 +87,15 @@ func TestNativePersistence(t *testing.T) {
 	rows, err := store.Load(t.Context(), string(session.SessionId))
 	require.NoError(t, err)
 	require.NotEmpty(t, rows)
-	var mirrored bytes.Buffer
-	for _, row := range rows[""] {
-		mirrored.Write(row)
+	var record struct {
+		Sessions []opencode.NativeSession `json:"sessions"`
 	}
-	require.Contains(t, mirrored.String(), marker)
+	require.Len(t, rows["config"], 1)
+	require.NoError(t, json.Unmarshal(rows["config"][0], &record))
+	require.Len(t, record.Sessions, 1)
+	carrier, err := json.Marshal(record.Sessions[0].Metadata)
+	require.NoError(t, err)
+	require.Contains(t, string(carrier), marker, "the native session information keeps its carrier")
 	raw, err := a.HandleExtensionMethod(t.Context(), opencodeacp.AccountUsageMethod, json.RawMessage(`{"sessionId":"`+string(session.SessionId)+`","providerId":"opencode-go"}`))
 	require.NoError(t, err)
 	encoded, err := json.Marshal(raw)
@@ -368,18 +372,14 @@ func TestNativeImageReplayAndAccountUsage(t *testing.T) {
 
 func assertStoredDirectory(t *testing.T, store acpcore.SessionStore, id acp.SessionId, directory string) {
 	t.Helper()
-	rows, err := store.Load(t.Context(), string(id))
+	var record map[string]json.RawMessage
+	_, found, err := sessionlog.Load(t.Context(), store, string(id), &record)
 	require.NoError(t, err)
-	require.NotEmpty(t, rows[""])
-	var snapshot struct {
-		Info struct {
-			Location struct {
-				Directory string `json:"directory"`
-			} `json:"location"`
-		} `json:"info"`
-	}
-	require.NoError(t, json.Unmarshal(rows[""][0], &snapshot))
-	require.Equal(t, directory, snapshot.Info.Location.Directory)
+	require.True(t, found)
+	var sessions []opencode.NativeSession
+	require.NoError(t, json.Unmarshal(record["sessions"], &sessions))
+	require.NotEmpty(t, sessions)
+	require.Equal(t, directory, sessions[0].Location.Directory)
 }
 
 func storedPendingInputs(t *testing.T, store acpcore.SessionStore, id acp.SessionId) map[string][]json.RawMessage {
@@ -505,15 +505,11 @@ func TestNativeCompletedCheckpointWithActiveChildAndShell(t *testing.T) {
 	}
 	generation, err := store.Load(t.Context(), string(created.SessionId))
 	require.NoError(t, err)
-	var saved opencode.Export
-	require.NoError(t, json.Unmarshal(generation[""][0], &saved))
+	stored := storedMessages(t, generation[""])
+	saved := opencode.Export{Info: opencode.NativeSession{ID: id}, Messages: stored[id]}
 	require.Equal(t, "idle", saved.Messages[len(saved.Messages)-1].Type)
-	require.False(t, slices.ContainsFunc(saved.Messages, func(message opencode.NativeMessage) bool { return message.ID == shellID }))
-	for _, row := range generation[""][1:] {
-		var descendant opencode.Export
-		require.NoError(t, json.Unmarshal(row, &descendant))
-		require.Empty(t, descendant.Messages)
-	}
+	require.False(t, slices.ContainsFunc(saved.Messages, func(message opencode.Message) bool { return message.ID == shellID }))
+	require.Len(t, stored, 1, "descendants without a completed execution have empty history")
 	var active struct {
 		Data map[string]opencode.NativeSessionStatus `json:"data"`
 	}
@@ -525,8 +521,8 @@ func TestNativeCompletedCheckpointWithActiveChildAndShell(t *testing.T) {
 	require.NoError(t, native.Wait(t.Context(), child.Data.ID))
 	completed, err := native.Export(t.Context(), id)
 	require.NoError(t, err)
-	shellIndex := slices.IndexFunc(completed.Messages, func(message opencode.NativeMessage) bool { return message.ID == shellID })
-	markerIndex := slices.IndexFunc(completed.Messages, func(message opencode.NativeMessage) bool {
+	shellIndex := slices.IndexFunc(completed.Messages, func(message opencode.Message) bool { return message.ID == shellID })
+	markerIndex := slices.IndexFunc(completed.Messages, func(message opencode.Message) bool {
 		return message.ID == saved.Messages[len(saved.Messages)-1].ID
 	})
 	require.GreaterOrEqual(t, shellIndex, 0)
@@ -546,4 +542,48 @@ func TestNativeCompletedCheckpointWithActiveChildAndShell(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, restored.Close())
 	}
+}
+
+// TestNativeToolEnvironment proves the native environment plugin gives tools
+// the session's environment on every call, including after the carrier changes.
+func TestNativeToolEnvironment(t *testing.T) {
+	if os.Getenv("ACP_GO_OPENCODEV2_RUN_INTEGRATION") != "1" {
+		t.Skip("set ACP_GO_OPENCODEV2_RUN_INTEGRATION=1")
+	}
+	config := localToolModel(t, `printf 'probe=%s' "$ACP_PROBE"`)
+	h := newHarness(t, opencodeacp.WithHome(t.TempDir()), opencodeacp.WithSeedFiles(map[string]string{"opencode.json": config}), opencodeacp.WithDefaultModel("probe/probe"))
+	h.initialize()
+	cwd := t.TempDir()
+	start := func(value string) wire.SessionRequestOption {
+		return opencodeacp.WithSessionOpenCodeOptions(opencodeacp.NewOpenCodeOptions(opencodeacp.WithOpenCodeEnv(map[string]string{"ACP_PROBE": value}), opencodeacp.WithOpenCodePermission("allow")))
+	}
+	created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd, start("first")))
+	require.NoError(t, err)
+	toolOutput := func() string {
+		var output strings.Builder
+		for _, update := range h.rec.snapshot() {
+			if call := update.Update.ToolCallUpdate; call != nil {
+				for _, content := range call.Content {
+					if content.Content != nil && content.Content.Content.Text != nil {
+						output.WriteString(content.Content.Content.Text.Text)
+					}
+				}
+			}
+		}
+
+		return output.String()
+	}
+	for range 2 {
+		response, promptErr := h.prompt(created.SessionId, "probe", nil)
+		require.NoError(t, promptErr)
+		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	}
+	require.Equal(t, 2, strings.Count(toolOutput(), "probe=first"), toolOutput())
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(created.SessionId, cwd, start("second")))
+	require.NoError(t, err)
+	_, err = h.prompt(created.SessionId, "probe", nil)
+	require.NoError(t, err)
+	require.Contains(t, toolOutput(), "probe=second", "a changed carrier reaches the next tool call")
 }

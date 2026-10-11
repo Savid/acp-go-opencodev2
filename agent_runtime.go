@@ -27,10 +27,17 @@ const sessionShutdownGrace = 2 * time.Second
 const serverStartupTimeout = 2 * time.Minute
 const serverHealthTimeout = 2 * time.Second
 
+// bindingStallLimit bounds how long the shared event pump holds the native
+// stream for one binding whose queue stays full before that binding ends.
+const bindingStallLimit = 2 * time.Minute
+
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
 	proc        *process.Process
 	observe     *observer.Observer
+	log         *slog.Logger
+	stallLimit  time.Duration
+	refusals    sync.WaitGroup
 	client      *opencode.Client
 	executable  string
 	environment []string
@@ -84,7 +91,7 @@ func (a *Agent) ensureRuntime(ctx context.Context) (*runtime, error) {
 			return nil, wire.RuntimeUnavailable(vendor)
 		}
 
-		return nil, wire.InternalFailure(vendor, internalClassNativeStart)
+		return nil, wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	a.runtime = rt
@@ -189,9 +196,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 	select {
 	case addressErr := <-addressReady:
 		if addressErr != nil {
-			failure := wire.TransportFailure(readyCtx, proc, "opencode server", addressErr, nil)
-
-			return nil, errors.New(failure.Message)
+			return nil, process.LaunchFailure(proc, "opencode server", addressErr)
 		}
 	case <-readyCtx.Done():
 		return nil, fmt.Errorf("native server address: %w", readyCtx.Err())
@@ -201,27 +206,11 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, fmt.Errorf("native health after %s: %w", time.Since(started).Round(time.Millisecond), healthErr)
 	}
 
-	healthDuration := time.Since(started)
-
-	var doc struct {
-		Components struct {
-			Schemas map[string]any `json:"schemas"`
-		} `json:"components"`
-	}
-	if docErr := client.Do(readyCtx, "", http.MethodGet, "/openapi.json", nil, &doc); docErr != nil {
-		return nil, fmt.Errorf("native schema after %s: %w", time.Since(started).Round(time.Millisecond), docErr)
-	}
-
-	if doc.Components.Schemas["Session.Message.Info"] == nil || doc.Components.Schemas["Form.Info"] == nil {
-		return nil, errors.New("OpenCode v2 session and form API required")
-	}
-
 	if writeErr := os.WriteFile(filepath.Join(root, "endpoint"), []byte(client.URL), 0o600); writeErr != nil {
 		return nil, writeErr
 	}
 
-	a.log.InfoContext(ctx, "opencode server ready",
-		slog.Duration("health_duration", healthDuration), slog.Duration("schema_duration", time.Since(started)-healthDuration))
+	a.log.InfoContext(ctx, "opencode server ready", slog.Duration("health_duration", time.Since(started)))
 
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
 
@@ -232,7 +221,7 @@ func (a *Agent) startRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	rt := &runtime{proc: proc, observe: a.observe, client: client, executable: executable, environment: env, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), stdoutDone: stdoutDone, bindings: map[string]*binding{}}
+	rt := &runtime{proc: proc, observe: a.observe, log: a.log, stallLimit: bindingStallLimit, client: client, executable: executable, environment: env, stream: stream, root: root, lock: lock, cancel: runtimeCancel, done: make(chan struct{}), stdoutDone: stdoutDone, bindings: map[string]*binding{}}
 	transferred = true
 
 	go rt.pump(runtimeCtx)
@@ -274,12 +263,7 @@ func (a *Agent) waitForServerHealth(ctx context.Context, client *opencode.Client
 
 		select {
 		case <-proc.Done():
-			message := "opencode server exited before it was ready"
-			if tail := proc.StderrTail(); tail != "" {
-				message += ": " + tail
-			}
-
-			return errors.New(message)
+			return process.LaunchFailure(proc, "opencode server", errors.New("no healthy response"))
 		case <-ctx.Done():
 			return fmt.Errorf("last health request: %v: %w", err, ctx.Err())
 		case <-ticker.C:
@@ -291,30 +275,28 @@ func (rt *runtime) pump(ctx context.Context) {
 	defer close(rt.done)
 
 	for event := range rt.stream.Events {
-		id := event.SessionID()
-		if id == "" {
+		if event.SessionID == "" {
 			continue
 		}
 
 		rt.mu.Lock()
-
-		b := rt.bindings[id]
-		if b != nil {
-			select {
-			case b.events <- event:
-			default:
-				b.cancel()
-			}
-		}
+		b := rt.bindings[event.SessionID]
 		rt.mu.Unlock()
 
-		if b == nil && (event.Type == eventPermissionAsked || event.Type == eventFormCreated) {
-			rt.rejectChildDialog(ctx, event)
+		if b != nil {
+			rt.deliver(ctx, b, event)
+
+			continue
+		}
+
+		if event.Type == eventPermissionAsked || event.Type == eventFormCreated {
+			rt.refusals.Go(func() { rt.rejectChildDialog(ctx, event) })
 		}
 	}
 
 	rt.cancel()
 	rt.stream.Close()
+	rt.refusals.Wait()
 
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
 	defer cancel()
@@ -339,13 +321,45 @@ func (rt *runtime) pump(ctx context.Context) {
 	_ = os.RemoveAll(rt.root)
 }
 
+// deliver hands one event to its binding in stream order. A full queue holds
+// the shared stream, so the native server waits rather than an event being
+// lost; a binding whose queue stays full past the stall limit ends with an
+// explicit cause its turn reports.
+func (rt *runtime) deliver(ctx context.Context, b *binding, event opencode.Event) {
+	select {
+	case b.events <- event:
+		return
+	default:
+	}
+
+	rt.log.WarnContext(ctx, "opencode session event queue full; holding the native event stream",
+		slog.String("native_session_id", event.SessionID), slog.Int("capacity", cap(b.events)))
+
+	started := time.Now()
+	timer := time.NewTimer(rt.stallLimit)
+
+	defer timer.Stop()
+
+	select {
+	case b.events <- event:
+		rt.log.InfoContext(ctx, "opencode session event queue drained",
+			slog.String("native_session_id", event.SessionID), slog.Duration("held", time.Since(started)))
+	case <-b.ending:
+	case <-ctx.Done():
+	case <-timer.C:
+		rt.log.ErrorContext(ctx, "opencode session event queue overflow; ending the session binding",
+			slog.String("native_session_id", event.SessionID), slog.Int("capacity", cap(b.events)), slog.Duration("held", rt.stallLimit))
+		b.end(fmt.Errorf("opencode session event queue stayed full for %s", rt.stallLimit))
+	}
+}
+
 // rejectChildDialog prevents an unbound descendant from holding its parent's
 // execution indefinitely. Unrelated native sessions remain their client's own.
 func (rt *runtime) rejectChildDialog(ctx context.Context, event opencode.Event) {
 	ctx, cancel := context.WithTimeout(ctx, sessionAbortTimeout)
 	defer cancel()
 
-	id := event.SessionID()
+	id := event.SessionID
 
 	seen := map[string]bool{}
 	for parent := id; parent != "" && !seen[parent] && len(seen) < 128; {

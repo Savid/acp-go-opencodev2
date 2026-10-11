@@ -29,7 +29,6 @@ type NativeSession struct {
 }
 
 // NativeMessage is a projected message returned by the native transcript API.
-// Raw retains fields needed by import even when ACP does not display them.
 type NativeMessage struct {
 	ID      string             `json:"id"`
 	Type    string             `json:"type"`
@@ -47,22 +46,55 @@ type NativeMessage struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
-	Raw json.RawMessage `json:"-"`
 }
 
-func (m *NativeMessage) UnmarshalJSON(data []byte) error {
-	type plain NativeMessage
+// Message is one exported native message: its raw bytes and the fields a
+// checkpoint orders and cuts by. Decode yields the full projection.
+type Message struct {
+	ID      string
+	Type    string
+	Outcome string
+	Created int64
+	Raw     json.RawMessage
+}
 
-	var value plain
-	if err := json.Unmarshal(data, &value); err != nil {
+func (m *Message) UnmarshalJSON(data []byte) error {
+	message, err := ParseMessage(append(json.RawMessage(nil), data...))
+	if err != nil {
 		return err
 	}
 
-	*m = NativeMessage(value)
-
-	m.Raw = append(json.RawMessage(nil), data...)
+	*m = message
 
 	return nil
+}
+
+// ParseMessage reads a message whose raw bytes the caller hands over.
+func ParseMessage(raw json.RawMessage) (Message, error) {
+	var value struct {
+		ID      string `json:"id"`
+		Type    string `json:"type"`
+		Outcome string `json:"outcome"`
+		Time    struct {
+			Created int64 `json:"created"`
+		} `json:"time"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return Message{}, err
+	}
+
+	return Message{ID: value.ID, Type: value.Type, Outcome: value.Outcome, Created: value.Time.Created, Raw: raw}, nil
+}
+
+func (m Message) MarshalJSON() ([]byte, error) { return m.Raw, nil }
+
+// Decode returns the message's full projection.
+func (m Message) Decode() (NativeMessage, error) {
+	var message NativeMessage
+
+	err := json.Unmarshal(m.Raw, &message)
+
+	return message, err
 }
 
 // Content is one native assistant or tool content block.
@@ -137,49 +169,41 @@ type Model struct {
 	} `json:"variants"`
 	Limit map[string]float64 `json:"limit"`
 }
+
+// Event is one native SSE frame. SessionID names the session the event
+// addresses, read from its data once when the frame is decoded.
 type Event struct {
-	ID      string          `json:"id"`
-	Type    string          `json:"type"`
-	Created int64           `json:"created"`
-	Data    json.RawMessage `json:"data"`
-	Durable *struct {
-		AggregateID string `json:"aggregateID"`
-		Seq         int64  `json:"seq"`
-		Version     int    `json:"version"`
-	} `json:"durable,omitempty"`
-	Raw json.RawMessage `json:"-"`
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	Created   int64           `json:"created"`
+	Data      json.RawMessage `json:"data"`
+	SessionID string          `json:"-"`
+	Raw       json.RawMessage `json:"-"`
 }
 
-func (e *Event) UnmarshalJSON(data []byte) error {
-	type plain Event
-
-	var value plain
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
+// DecodeEvent decodes one owned SSE frame, which becomes the event's Raw.
+func DecodeEvent(frame []byte) (Event, error) {
+	var event Event
+	if err := json.Unmarshal(frame, &event); err != nil {
+		return Event{}, err
 	}
 
-	*e = Event(value)
-
-	e.Raw = append(json.RawMessage(nil), data...)
-
-	return nil
-}
-func (e Event) SessionID() string {
 	var data struct {
 		SessionID string `json:"sessionID"`
 		Form      struct {
 			SessionID string `json:"sessionID"`
 		} `json:"form"`
 	}
-	if json.Unmarshal(e.Data, &data) != nil {
-		return ""
+	if json.Unmarshal(event.Data, &data) == nil {
+		event.SessionID = data.SessionID
+		if event.SessionID == "" {
+			event.SessionID = data.Form.SessionID
+		}
 	}
 
-	if data.SessionID == "" {
-		return data.Form.SessionID
-	}
+	event.Raw = frame
 
-	return data.SessionID
+	return event, nil
 }
 
 type PermissionRequest struct {
@@ -228,11 +252,12 @@ func (f *FormField) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Export is the native, lossless session transfer format.
+// Export is the native, lossless session transfer format: the session's
+// information and its settled messages, each kept as its raw bytes.
 type Export struct {
-	Info     NativeSession   `json:"info"`
-	Messages []NativeMessage `json:"messages"`
-	Raw      json.RawMessage `json:"-"`
+	Info     NativeSession
+	InfoRaw  json.RawMessage
+	Messages []Message
 }
 
 // InboxInput is native input waiting for the next execution.
@@ -250,16 +275,32 @@ type InboxInput struct {
 }
 
 func (e *Export) UnmarshalJSON(data []byte) error {
-	type plain Export
-
-	var value plain
+	var value struct {
+		Info     json.RawMessage `json:"info"`
+		Messages []Message       `json:"messages"`
+	}
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
 
-	*e = Export(value)
+	if err := json.Unmarshal(value.Info, &e.Info); err != nil {
+		return err
+	}
 
-	e.Raw = append(json.RawMessage(nil), data...)
+	e.InfoRaw = value.Info
+	e.Messages = value.Messages
 
 	return nil
+}
+
+func (e Export) MarshalJSON() ([]byte, error) {
+	messages := e.Messages
+	if messages == nil {
+		messages = []Message{}
+	}
+
+	return json.Marshal(struct {
+		Info     json.RawMessage `json:"info"`
+		Messages []Message       `json:"messages"`
+	}{e.InfoRaw, messages})
 }

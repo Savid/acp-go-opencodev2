@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -196,14 +195,12 @@ func TestLocalImagesSurviveFullHistoryRestore(t *testing.T) {
 	for i := range content {
 		content[i] = opencode.Content{Type: partFile, URI: path, MIME: image.MIMEPNG}
 	}
-	row, err := json.Marshal(fakeExport{
+	graph := storedGraph(t, s, fakeExport{
 		Info:     opencode.NativeSession{ID: s.nativeID, Location: opencode.Location{Directory: dir}},
 		Messages: []opencode.NativeMessage{{ID: "msg_images", Type: roleAssistant, Content: content}},
 	})
-	require.NoError(t, err)
-	rows := [][]byte{row}
-	s.captureImages(rows)
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(s.id), rows, s.record()))
+	s.captureImages(graph[0].Messages)
+	require.NoError(t, sessionlog.NewMirror(store, string(s.id)).Commit(t.Context(), sessionlog.Rows(graphRows(graph)), s.record()))
 	require.NoError(t, os.Remove(path))
 	h := newHarness(t, WithSessionStore(store))
 	h.initialize()

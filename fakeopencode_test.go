@@ -24,7 +24,6 @@ import (
 
 const fakeOpenCodeEnv = "ACP_GO_OPENCODEV2_TEST_FAKE"
 const fakeOpenCodeEnvQueuedWake = "ACP_GO_OPENCODEV2_TEST_QUEUED_WAKE"
-const fakeOpenCodeEnvHistoryAdvance = "ACP_GO_OPENCODEV2_TEST_HISTORY_ADVANCE"
 const fakeOpenCodeEnvResumeHold = "ACP_GO_OPENCODEV2_TEST_RESUME_HOLD"
 const fakeOpenCodeEnvStartHold = "ACP_GO_OPENCODEV2_TEST_START_HOLD"
 const fakeOpenCodeEnvHealthHold = "ACP_GO_OPENCODEV2_TEST_HEALTH_HOLD"
@@ -277,31 +276,6 @@ func (f *fakeOpenCode) sessionHTTP(w http.ResponseWriter, r *http.Request, id st
 	}
 }
 
-func (f *fakeOpenCode) advanceHistory(id string) {
-	marker := os.Getenv(fakeOpenCodeEnvHistoryAdvance)
-	data, err := os.ReadFile(marker)
-	if err != nil {
-		return
-	}
-	mode := string(data)
-	if mode != "always" {
-		_ = os.Remove(marker)
-	}
-	session := f.sessions[id]
-	if mode == "child" {
-		child := session.Info
-		child.ID = opencode.NewID("ses_")
-		child.ParentID = id
-		child.Title = "late history child"
-		f.sessions[child.ID] = &fakeExport{Info: child, Messages: []opencode.NativeMessage{}}
-	} else {
-		session.Info.Title = "late history row"
-		if mode == "always" {
-			session.Info.Title += opencode.NewID("")
-		}
-	}
-	f.save()
-}
 func (f *fakeOpenCode) agents(w http.ResponseWriter, r *http.Request) {
 	var config struct {
 		Plugins []string `json:"plugins"`
@@ -309,7 +283,7 @@ func (f *fakeOpenCode) agents(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal([]byte(os.Getenv("OPENCODE_CONFIG_CONTENT")), &config)
 	for _, plugin := range config.Plugins {
 		u, _ := url.Parse(plugin)
-		dir, _ := filepath.EvalSymlinks(r.URL.Query().Get("location[directory]"))
+		dir := r.URL.Query().Get("location[directory]")
 		hash := sha256.Sum256([]byte(dir))
 		root := filepath.Join(u.Path, "ready")
 		_ = os.MkdirAll(root, 0o700)
@@ -501,10 +475,6 @@ func (f *fakeOpenCode) globalHTTP(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		fakeWrite(w, map[string]any{"version": "2.0.21"})
-
-		return true
-	case "/openapi.json":
-		fakeWrite(w, map[string]any{"components": map[string]any{"schemas": map[string]any{"Session.Message.Info": map[string]any{}, "Form.Info": map[string]any{}}}})
 
 		return true
 	case "/api/integration", "/api/credential":
@@ -736,7 +706,6 @@ func (f *fakeOpenCode) persistenceHTTP(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if pieces[4] == "export" {
-		f.advanceHistory(id)
 		fakeData(w, session)
 
 		return

@@ -327,7 +327,7 @@ func TestCommandCompletionWaitsForStream(t *testing.T) {
 	for _, event := range []opencode.Event{
 		{Type: eventExecutionStarted, Created: 90, Data: json.RawMessage(`{}`)},
 		{Type: "session.text.ended", Created: 95, Data: json.RawMessage(`{"assistantMessageID":"msg_command","ordinal":0,"text":"command output"}`)},
-		{ID: "evt_command_end", Type: "session.execution.succeeded", Created: 100, Data: json.RawMessage(`{"sessionID":"` + s.nativeID + `"}`)},
+		{ID: "evt_command_end", Type: "session.execution.succeeded", Created: 100, SessionID: s.nativeID, Data: json.RawMessage(`{"sessionID":"` + s.nativeID + `"}`)},
 	} {
 		rt.events <- event
 	}
@@ -544,7 +544,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	require.NoError(t, err)
 	require.True(t, found)
 	markers := 0
-	for _, m := range nativeMessages(rows, s.nativeID) {
+	for _, m := range storedMessages(t, rows, record, s.nativeID) {
 		if m.Type == "idle" {
 			markers++
 		}
@@ -577,7 +577,7 @@ func checkNativeSuccessor(t *testing.T, mode string) {
 	require.NoError(t, err)
 	require.True(t, found)
 	markers = 0
-	for _, m := range nativeMessages(rows, s.nativeID) {
+	for _, m := range storedMessages(t, rows, record, s.nativeID) {
 		if m.Type == "idle" {
 			markers++
 		}
@@ -661,7 +661,7 @@ func TestShutdownInterruptEndsBindingWithoutSnapshot(t *testing.T) {
 	_, err = a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "SHUTDOWN"))
 	data := requestErrorData(t, err)
 	require.Equal(t, wire.CauseTransport, data[wire.FieldCause])
-	require.NotEqual(t, "session mirror commit failed", data[wire.FieldMessage])
+	require.Equal(t, "opencode interrupted the execution for shutdown", data[wire.FieldMessage], "the turn names why its binding ended")
 	require.Zero(t, snapshots.Load())
 	require.False(t, rt.alive())
 }

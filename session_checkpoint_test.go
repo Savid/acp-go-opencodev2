@@ -12,14 +12,15 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 	"github.com/stretchr/testify/require"
 )
 
-func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
-	for _, mode := range []string{"growing", "changing tail", "changing child", "completed child", "missing marker", "wrong outcome", "changed message", "changed inbox", "export failure", "active child", "delivered inbox", "changed delivered inbox"} {
+func TestExecutionSnapshotCutsAtMarker(t *testing.T) {
+	for _, mode := range []string{"growing", "changing tail", "changing child", "completed child", "missing marker", "wrong outcome", "export failure", "active child", "delivered inbox"} {
 		t.Run(mode, func(t *testing.T) {
 			a, s, _ := newDirectSession(t)
 			response, err := a.Prompt(t.Context(), wire.TextPromptRequest(s.id, "HELLO"))
@@ -34,7 +35,7 @@ func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
 			require.NoError(t, err)
 			marker := exported.Messages[len(exported.Messages)-1]
 			require.Equal(t, "idle", marker.Type)
-			terminal := opencode.Event{ID: strings.Replace(marker.ID, "msg_", "evt_", 1), Type: "session.execution.succeeded", Data: json.RawMessage(`{"sessionID":"` + s.nativeID + `"}`)}
+			terminal := opencode.Event{ID: strings.Replace(marker.ID, "msg_", "evt_", 1), Type: "session.execution.succeeded", SessionID: s.nativeID}
 			if mode == "active child" {
 				child := createNativeChild(t, rt, s.nativeID, s.cwd)
 				require.NoError(t, native.Do(t.Context(), s.cwd, http.MethodPost, opencode.SessionPath(child.ID)+"/prompt", map[string]any{"id": opencode.NewMessageID(), "text": "SLOW"}, nil))
@@ -50,15 +51,9 @@ func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
 			}
 			var reads atomic.Int32
 			var inboxRead atomic.Bool
-			var firstRaw []byte
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.Contains(mode, "delivered inbox") && strings.HasSuffix(r.URL.Path, "/inbox") && inboxRead.CompareAndSwap(false, true) {
+				if mode == "delivered inbox" && strings.HasSuffix(r.URL.Path, "/inbox") && inboxRead.CompareAndSwap(false, true) {
 					fakeData(w, []map[string]any{{"id": "msg_delivered", "sessionID": s.nativeID, "type": "synthetic", "payload": map[string]any{"text": "delivered"}, "delivery": "queue", "time": map[string]any{"created": 1}}})
-
-					return
-				}
-				if mode == "changed inbox" && strings.HasSuffix(r.URL.Path, "/inbox") {
-					fakeData(w, []map[string]any{{"id": fmt.Sprintf("msg_input_%d", reads.Load()), "sessionID": s.nativeID, "type": "synthetic", "payload": map[string]any{"text": "pending"}, "delivery": "queue", "time": map[string]any{"created": 1}}})
 
 					return
 				}
@@ -82,11 +77,7 @@ func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
 
 					return
 				}
-				raw := checkpointExport(mode, count, exported)
-				if count == 1 {
-					firstRaw = raw
-				}
-				fakeData(w, json.RawMessage(raw))
+				fakeData(w, json.RawMessage(checkpointExport(mode, count, exported)))
 			}))
 			defer proxy.Close()
 			rt.client.URL = proxy.URL
@@ -94,55 +85,53 @@ func TestExecutionSnapshotVerifiesPrefix(t *testing.T) {
 			rt.client.URL = native.URL
 			rows, _, loadErr := sessionlog.Load(t.Context(), a.store, string(s.id), &record)
 			require.NoError(t, loadErr)
-			if mode == "growing" || mode == "changing tail" || mode == "changing child" || mode == "completed child" || mode == "active child" || mode == "delivered inbox" {
-				require.NoError(t, err)
-				messages := nativeMessages(rows, s.nativeID)
-				require.Len(t, messages, len(exported.Messages))
-				require.Equal(t, marker.ID, messages[len(messages)-1].ID)
-				if mode == "delivered inbox" {
-					require.Len(t, record.PendingInputs[s.nativeID], 1)
-				} else {
-					require.Empty(t, record.PendingInputs)
-				}
-				if mode == "completed child" {
-					require.Len(t, nativeMessages(rows, childID), 2)
-				}
-				if mode == "changing child" {
-					require.Empty(t, nativeMessages(rows, childID))
-				}
-				if mode == "growing" || mode == "changing tail" || mode == "delivered inbox" {
-					require.NotEqual(t, firstRaw, rows[0])
-					require.EqualValues(t, 2, reads.Load())
-				}
-			} else {
+			if mode == "missing marker" || mode == "wrong outcome" || mode == "export failure" {
 				require.Error(t, err)
-				require.Equal(t, before, rows, "unverified state must not replace the durable generation")
-				requireSnapshotFailure(t, mode, err, reads.Load())
+				require.Equal(t, before, rows, "an unread history must not replace the durable generation")
+				if mode != "export failure" {
+					require.ErrorContains(t, err, "native execution marker missing")
+					require.EqualValues(t, markerAttempts, reads.Load())
+				}
+
+				return
+			}
+			require.NoError(t, err)
+			messages := storedMessages(t, rows, record, s.nativeID)
+			require.Len(t, messages, len(exported.Messages))
+			require.Equal(t, marker.ID, messages[len(messages)-1].ID)
+			if mode == "delivered inbox" {
+				require.Len(t, record.PendingInputs[s.nativeID], 1)
+			} else {
+				require.Empty(t, record.PendingInputs)
+			}
+			if mode == "completed child" {
+				require.Len(t, storedMessages(t, rows, record, childID), 2)
+			}
+			if mode == "changing child" {
+				require.Empty(t, storedMessages(t, rows, record, childID))
+			}
+			if mode != "active child" {
+				exports := 1
+				if childID != "" {
+					exports = 2
+				}
+				require.EqualValues(t, exports, reads.Load(), "a commit exports each session once")
 			}
 		})
 	}
 }
 
-func requireSnapshotFailure(t *testing.T, mode string, err error, reads int32) {
-	t.Helper()
-	switch mode {
-	case "missing marker", "wrong outcome":
-		require.ErrorContains(t, err, "native execution marker missing")
-		require.EqualValues(t, snapshotAttempts*2, reads)
-	case "changed inbox", "changed delivered inbox":
-		require.EqualValues(t, 2, reads, "a retry must not forget the mismatched input")
-	}
-}
-
 func checkpointExport(mode string, count int, exported opencode.Export) []byte {
-	value := fakeExport{Info: exported.Info, Messages: append([]opencode.NativeMessage(nil), exported.Messages...)}
+	value := fakeExport{Info: exported.Info}
+	for _, message := range exported.Messages {
+		native, _ := message.Decode()
+		value.Messages = append(value.Messages, native)
+	}
 	switch mode {
 	case "missing marker":
 		value.Messages = value.Messages[:len(value.Messages)-1]
 	case "wrong outcome":
 		value.Messages[len(value.Messages)-1].Outcome = "failed"
-	case "changed message":
-		value.Messages[0].Text = fmt.Sprintf("changed-%d", count)
 	case "changing tail":
 		value.Messages = append(value.Messages, opencode.NativeMessage{ID: "msg_live", Type: roleAssistant, Text: fmt.Sprintf("live-%d", count)})
 	case "growing":
@@ -153,20 +142,75 @@ func checkpointExport(mode string, count int, exported opencode.Export) []byte {
 		value.Info.Time.Updated = int64(count)
 	}
 	raw, _ := json.Marshal(value)
-	if strings.Contains(mode, "delivered inbox") {
+	if mode == "delivered inbox" {
 		var encoded map[string]json.RawMessage
 		_ = json.Unmarshal(raw, &encoded)
 		messages := make([]json.RawMessage, 0, len(value.Messages)+1)
 		_ = json.Unmarshal(encoded["messages"], &messages)
-		text := "delivered"
-		if mode == "changed delivered inbox" {
-			text = "changed"
-		}
-		message, _ := json.Marshal(map[string]any{"id": "msg_delivered", "type": "synthetic", "text": text, "time": map[string]any{"created": 1}})
+		message, _ := json.Marshal(map[string]any{"id": "msg_delivered", "type": "synthetic", "text": "delivered", "time": map[string]any{"created": 1}})
 		messages = append(messages, message)
 		encoded["messages"], _ = json.Marshal(messages)
 		raw, _ = json.Marshal(encoded)
 	}
 
 	return raw
+}
+
+// storedMessages returns one session's messages from a stored generation.
+func storedMessages(t *testing.T, rows [][]byte, record sessionRecord, id string) []opencode.Message {
+	t.Helper()
+	graph, err := decodeStored(rows, record)
+	require.NoError(t, err)
+	for i := range graph {
+		if graph[i].Info.ID == id {
+			return graph[i].Messages
+		}
+	}
+
+	return nil
+}
+
+// BenchmarkTurnCommit measures one turn's commit of a long synthetic
+// transcript: append decodes one export and appends the turn's rows; republish
+// decodes the export twice and republishes every row.
+func BenchmarkTurnCommit(b *testing.B) {
+	for _, mode := range []string{"append", "republish"} {
+		b.Run(mode, func(b *testing.B) {
+			store := acpcore.NewInMemorySessionStore()
+			mirror := sessionlog.NewMirror(store, "ses_bench")
+			text := strings.Repeat("x", 2048)
+			messages := make([]opencode.NativeMessage, 0, 4096)
+			for len(messages) < 2000 {
+				messages = append(messages, benchMessage(len(messages), text))
+			}
+			info := opencode.NativeSession{ID: "ses_bench"}
+			record := sessionRecord{SessionID: "ses_bench", NativeSessionID: "ses_bench", Cwd: "/work", UpdatedAtUnixMilli: 1}
+			for b.Loop() {
+				b.StopTimer()
+				messages = append(messages, benchMessage(len(messages), text), benchMessage(len(messages)+1, text))
+				body, err := json.Marshal(fakeExport{Info: info, Messages: messages})
+				require.NoError(b, err)
+				b.StartTimer()
+				reads := 1
+				if mode == "republish" {
+					reads = 2
+					mirror.Reset()
+				}
+				var export opencode.Export
+				for range reads {
+					require.NoError(b, json.Unmarshal(body, &export))
+				}
+				record.Sessions = []json.RawMessage{export.InfoRaw}
+				rows := graphRows([]nativeSnapshot{{Export: export}})
+				require.NoError(b, mirror.Commit(b.Context(), sessionlog.Rows(rows), record))
+			}
+		})
+	}
+}
+
+func benchMessage(index int, text string) opencode.NativeMessage {
+	message := opencode.NativeMessage{ID: fmt.Sprintf("msg_%06d", index), Type: roleAssistant, Content: []opencode.Content{{Type: fieldText, Text: text}}}
+	message.Time.Created = int64(index)
+
+	return message
 }

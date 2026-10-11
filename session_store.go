@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"maps"
 	"path/filepath"
 	"reflect"
@@ -13,17 +12,19 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
-	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/image"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
 
-// sessionRecord carries the accepted session configuration beside its native export.
+// sessionRecord carries the accepted session configuration and the native
+// information of every session in the graph, parent first, beside the
+// mirrored native messages.
 type sessionRecord struct {
 	SessionID             string                           `json:"sessionId"`
 	NativeSessionID       string                           `json:"nativeSessionId"`
+	Title                 string                           `json:"title,omitempty"`
 	Cwd                   string                           `json:"cwd"`
 	AdditionalDirectories []string                         `json:"additionalDirectories,omitempty"`
 	Env                   map[string]string                `json:"env,omitempty"`
@@ -32,6 +33,7 @@ type sessionRecord struct {
 	Effort                string                           `json:"effort,omitempty"`
 	Mode                  string                           `json:"mode,omitempty"`
 	Permission            string                           `json:"permission,omitempty"`
+	Sessions              []json.RawMessage                `json:"sessions"`
 	Artifacts             map[string]imageArtifact         `json:"artifacts,omitempty"`
 	PendingInputs         map[string][]opencode.InboxInput `json:"pendingInputs,omitempty"`
 	UpdatedAtUnixMilli    int64                            `json:"updatedAtUnixMilli"`
@@ -41,11 +43,11 @@ func (s *session) record() sessionRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, Artifacts: cloneArtifacts(s.artifacts), PendingInputs: clonePendingInputs(s.pendingInputs), UpdatedAtUnixMilli: time.Now().UnixMilli()}
+	return sessionRecord{SessionID: string(s.id), NativeSessionID: s.nativeID, Title: s.title, Cwd: s.cwd, AdditionalDirectories: slices.Clone(s.additionalDirectories), Env: maps.Clone(s.options.Env), ExtraPathDirs: slices.Clone(s.options.ExtraPathDirs), Model: s.model, Effort: s.effort, Mode: s.mode, Permission: s.options.Permission, Sessions: slices.Clone(s.nativeInfos), Artifacts: cloneArtifacts(s.artifacts), PendingInputs: clonePendingInputs(s.pendingInputs), UpdatedAtUnixMilli: time.Now().UnixMilli()}
 }
 
 func (r sessionRecord) validate(id string) error {
-	if !validNativeSessionID(r.NativeSessionID) || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 {
+	if !validNativeSessionID(r.NativeSessionID) || r.SessionID != id || !filepath.IsAbs(r.Cwd) || r.UpdatedAtUnixMilli <= 0 || len(r.Sessions) == 0 {
 		return errors.New("invalid session record")
 	}
 
@@ -108,9 +110,10 @@ func validNativeSessionID(id string) bool {
 	return true
 }
 
-// commitMirror atomically stores a verified native snapshot and its
-// configuration. An ephemeral session commits nothing: opencode's own database
-// holds it until the host deletes it.
+// commitMirror publishes the native graph and its configuration through the
+// session's mirror, which appends only the rows it has not committed. An
+// ephemeral session commits nothing: opencode's own database holds it until
+// the host deletes it.
 func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *opencode.Event) error {
 	if s.ephemeral {
 		return nil
@@ -119,19 +122,29 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 
-	if rt != nil && terminal == nil {
+	if rt == nil {
+		return errors.New("session has no native binding")
+	}
+
+	if terminal == nil {
 		if err := rt.client.Wait(ctx, s.nativeID); err != nil {
 			return err
 		}
 	}
 
-	rows, err := s.snapshotRows(ctx, rt, terminal)
+	graph, err := s.readGraph(ctx, rt, terminal)
 	if err != nil {
 		return err
 	}
 
-	ctx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
-	err = sessionlog.Commit(ctx, s.agent.store, string(s.id), rows, s.record())
+	s.captureImages(graph[0].Messages)
+
+	if s.mirror == nil {
+		s.mirror = sessionlog.NewMirror(s.agent.store, string(s.id))
+	}
+
+	ctx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
+	err = s.mirror.Commit(ctx, sessionlog.Rows(graphRows(graph)), s.record())
 	finish(err)
 
 	if err == nil {
@@ -143,36 +156,13 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 	return err
 }
 
-// snapshotRows captures exported native history and its referenced output images.
-func (s *session) snapshotRows(ctx context.Context, rt *binding, terminal *opencode.Event) ([][]byte, error) {
-	if rt == nil {
-		return nil, errors.New("session has no native binding")
-	}
-
-	rows, err := s.readNativeRows(ctx, rt, terminal)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(rows) == 0 {
-		return nil, errors.New("native session history missing")
-	}
-
-	s.captureImages(rows)
-
-	return rows, nil
-}
-
 type storedSession struct {
-	rows   [][]byte
+	graph  []opencode.Export
 	record sessionRecord
 	found  bool
 }
 
 func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession, error) {
-	ctx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
-	defer cancel()
-
 	ctx, finish := a.observe.StartSessionStore(ctx, "load")
 
 	var record sessionRecord
@@ -182,91 +172,118 @@ func (a *Agent) loadStored(ctx context.Context, id acp.SessionId) (storedSession
 		err = record.validate(string(id))
 	}
 
+	var graph []opencode.Export
 	if err == nil && found {
-		var graph []opencode.Export
-
-		graph, err = decodeExports(rows, record.NativeSessionID)
-		if err == nil {
-			members := make(map[string]bool, len(graph))
-			for i := range graph {
-				members[graph[i].Info.ID] = true
-			}
-
-			for id := range record.PendingInputs {
-				if !members[id] {
-					err = errors.New("unrelated native pending input")
-
-					break
-				}
-			}
-		}
+		graph, err = decodeStored(rows, record)
 	}
 
 	if err == nil && found {
-		err = validateStoredImages(rows, record)
+		err = validateStoredImages(graph[0].Messages, record)
 	}
 
 	finish(err)
 
 	if err != nil {
-		return storedSession{}, a.restoreRefused(ctx, id, err)
+		return storedSession{}, wire.RestoreRefused(ctx, a.log, vendor, id, err)
 	}
 
-	return storedSession{rows: rows, record: record, found: found}, nil
+	return storedSession{graph: graph, record: record, found: found}, nil
 }
 
-// decodeExports validates a parent-first native session graph.
-func decodeExports(rows [][]byte, id string) ([]opencode.Export, error) {
-	if len(rows) == 0 {
-		return nil, errors.New("native export missing")
+// loadRecord reads a stored session's configuration without its native rows.
+func (a *Agent) loadRecord(ctx context.Context, id acp.SessionId) (sessionRecord, bool, error) {
+	ctx, finish := a.observe.StartSessionStore(ctx, "load_record")
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(ctx, a.store, string(id), &record)
+	if err == nil && found {
+		err = record.validate(string(id))
 	}
 
-	exports := make([]opencode.Export, 0, len(rows))
-	seen := map[string]bool{}
+	finish(err)
 
-	for index, row := range rows {
-		var item opencode.Export
-		if err := json.Unmarshal(row, &item); err != nil {
+	return record, found, err
+}
+
+// decodeStored rebuilds the parent-first native graph from the record's
+// session information and the mirrored message rows.
+func decodeStored(rows [][]byte, record sessionRecord) ([]opencode.Export, error) {
+	graph := make([]opencode.Export, len(record.Sessions))
+	index := make(map[string]int, len(record.Sessions))
+
+	for i, raw := range record.Sessions {
+		var info opencode.NativeSession
+		if err := json.Unmarshal(raw, &info); err != nil {
 			return nil, err
 		}
 
-		if !validNativeSessionID(item.Info.ID) || seen[item.Info.ID] {
+		_, duplicate := index[info.ID]
+		if !validNativeSessionID(info.ID) || duplicate {
 			return nil, errors.New("invalid native export identity")
 		}
 
-		if index == 0 && item.Info.ID != id || index > 0 && !seen[item.Info.ParentID] {
+		if _, parent := index[info.ParentID]; i == 0 && info.ID != record.NativeSessionID || i > 0 && !parent {
 			return nil, errors.New("unrelated native export")
 		}
 
-		messages := map[string]bool{}
-
-		for i := range item.Messages {
-			message := &item.Messages[i]
-			if message.ID == "" || message.Type == "" || messages[message.ID] {
-				return nil, errors.New("invalid native message identity")
-			}
-
-			messages[message.ID] = true
-		}
-
-		seen[item.Info.ID] = true
-		exports = append(exports, item)
+		index[info.ID] = i
+		graph[i] = opencode.Export{Info: info, InfoRaw: raw}
 	}
 
-	return exports, nil
+	if len(graph) == 0 {
+		return nil, errors.New("native export missing")
+	}
+
+	current := -1
+	messages := make([]map[string]bool, len(graph))
+
+	for _, raw := range rows {
+		var row storedRow
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, err
+		}
+
+		if row.Type == "" {
+			at, ok := index[row.SessionID]
+			if !ok || row.ID != "" || at == current {
+				return nil, errors.New("invalid native session row")
+			}
+
+			current = at
+
+			continue
+		}
+
+		message, err := opencode.ParseMessage(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		if current < 0 || message.ID == "" || messages[current][message.ID] {
+			return nil, errors.New("invalid native message identity")
+		}
+
+		if messages[current] == nil {
+			messages[current] = map[string]bool{}
+		}
+
+		messages[current][message.ID] = true
+		graph[current].Messages = append(graph[current].Messages, message)
+	}
+
+	return graph, nil
 }
 
-// hydrate imports absent conversations and adopts a longer native transcript.
-// The native API cannot replace an existing shorter transcript, so that case fails closed.
-func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([][]byte, error) {
+// hydrate imports absent conversations and adopts a longer native transcript,
+// returning the root's verified messages. The native API cannot replace an
+// existing shorter transcript, so that case fails closed.
+func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession) ([]opencode.Message, error) {
 	s.mu.Lock()
 	s.artifacts = cloneArtifacts(stored.record.Artifacts)
 	s.mu.Unlock()
 
-	want, err := decodeExports(stored.rows, s.nativeID)
-	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
-	}
+	want := stored.graph
 
 	for i := range want {
 		saved := &want[i]
@@ -280,63 +297,61 @@ func (s *session) hydrate(ctx context.Context, rt *binding, stored storedSession
 			}
 
 			if importErr := rt.client.Import(ctx, *saved, location); importErr != nil {
-				return nil, s.agent.restoreRefused(ctx, s.id, importErr)
+				return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, importErr)
 			}
 
 			for _, input := range stored.record.PendingInputs[saved.Info.ID] {
 				if enqueueErr := rt.client.Enqueue(ctx, input); enqueueErr != nil {
-					return nil, s.agent.restoreRefused(ctx, s.id, enqueueErr)
+					return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, enqueueErr)
 				}
 			}
 
 			if pendingErr := reconcileImportedInputs(ctx, rt, saved.Info.ID, stored.record.PendingInputs[saved.Info.ID]); pendingErr != nil {
-				return nil, s.agent.restoreRefused(ctx, s.id, pendingErr)
+				return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, pendingErr)
 			}
 		case readErr != nil:
-			return nil, s.agent.restoreRefused(ctx, s.id, readErr)
+			return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, readErr)
 		default:
 			if !current.ContainsHistory(*saved) {
-				return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native history conflicts with mirror"))
+				return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, errors.New("native history conflicts with mirror"))
 			}
 		}
 	}
 
-	rows, err := s.readNativeRows(ctx, rt, nil)
+	verified, err := s.readGraph(ctx, rt, nil)
 	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
-	}
-
-	verified, err := decodeExports(rows, s.nativeID)
-	if err != nil {
-		return nil, s.agent.restoreRefused(ctx, s.id, err)
+		return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 	}
 
 	s.mu.Lock()
 	pending := clonePendingInputs(s.pendingInputs)
 	s.mu.Unlock()
 
-	have := map[string]opencode.Export{}
-
+	have := make(map[string]*opencode.Export, len(verified))
 	for i := range verified {
-		item := &verified[i]
-		have[item.Info.ID] = *item
+		have[verified[i].Info.ID] = &verified[i].Export
 	}
 
 	for i := range want {
 		saved := &want[i]
 
 		current := have[saved.Info.ID]
+		if current == nil {
+			return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, errors.New("native import lost a session"))
+		}
+
 		if pendingErr := verifyPendingInputs(stored.record.PendingInputs[saved.Info.ID], pending[saved.Info.ID], current.Messages); pendingErr != nil {
-			return nil, s.agent.restoreRefused(ctx, s.id, pendingErr)
+			return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, pendingErr)
 		}
 
 		if !current.ContainsHistory(*saved) {
-			return nil, s.agent.restoreRefused(ctx, s.id, errors.New("native import changed message content"))
+			return nil, wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, errors.New("native import changed message content"))
 		}
 	}
 
-	return rows, nil
+	return verified[0].Messages, nil
 }
+
 func sameJSON(a, b []byte) bool {
 	var x, y any
 	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
@@ -345,59 +360,42 @@ func sameJSON(a, b []byte) bool {
 
 	return reflect.DeepEqual(x, y)
 }
-func (a *Agent) restoreRefused(ctx context.Context, id acp.SessionId, err error) error {
-	a.log.ErrorContext(ctx, "opencode session restore failed", slog.String("session_id", string(id)), slog.String("reason", err.Error()))
-
-	return wire.RestoreFailed(vendor)
-}
-func storedTitle(id string, rows [][]byte) string {
-	for _, row := range rows {
-		var item opencode.Export
-		if json.Unmarshal(row, &item) == nil && item.Info.ID == id && item.Info.Title != "" {
-			return item.Info.Title
-		}
-	}
-
-	return id
-}
-func nativeMessages(rows [][]byte, id string) []opencode.NativeMessage {
-	for _, row := range rows {
-		var item opencode.Export
-		if json.Unmarshal(row, &item) == nil && item.Info.ID == id {
-			return item.Messages
-		}
-	}
-
-	return nil
-}
-func (s *session) replay(ctx context.Context, rows [][]byte) error {
+func (s *session) replay(ctx context.Context, messages []opencode.Message) error {
 	c := &cycle{}
 
-	messages := nativeMessages(rows, s.nativeID)
 	for i := range messages {
-		message := &messages[i]
-		if message.Type == roleUser {
-			if message.Text != "" {
-				if err := s.emit(ctx, acp.UpdateUserMessageText(message.Text)); err != nil {
+		message, err := messages[i].Decode()
+		if err != nil {
+			return err
+		}
+
+		if message.Type != roleUser {
+			if err := s.projectMessage(ctx, c, message); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if message.Text != "" {
+			if err := s.emit(ctx, acp.UpdateUserMessageText(message.Text)); err != nil {
+				return err
+			}
+		}
+
+		for index, file := range message.Files {
+			file.ID = attachmentID(message.ID, index)
+			for _, block := range s.outputFile(file, nil) {
+				if err := s.emit(ctx, acp.UpdateUserMessage(block)); err != nil {
 					return err
 				}
 			}
-
-			for index, file := range message.Files {
-				file.ID = attachmentID(message.ID, index)
-				for _, block := range s.outputFile(file, nil) {
-					if err := s.emit(ctx, acp.UpdateUserMessage(block)); err != nil {
-						return err
-					}
-				}
-			}
-		} else if err := s.projectMessage(ctx, c, *message); err != nil {
-			return err
 		}
 	}
 
 	return nil
 }
+
 func clonePendingInputs(inputs map[string][]opencode.InboxInput) map[string][]opencode.InboxInput {
 	result := make(map[string][]opencode.InboxInput, len(inputs))
 	for id, rows := range inputs {
@@ -412,7 +410,7 @@ func clonePendingInputs(inputs map[string][]opencode.InboxInput) map[string][]op
 	return result
 }
 
-func verifyPendingInputs(saved, current []opencode.InboxInput, messages []opencode.NativeMessage) error {
+func verifyPendingInputs(saved, current []opencode.InboxInput, messages []opencode.Message) error {
 	for _, input := range saved {
 		found := false
 

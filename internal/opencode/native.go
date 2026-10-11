@@ -99,18 +99,22 @@ func WritePlugin(root, config string, ownsHome bool) (string, error) {
 	return string(data), err
 }
 
+// CheckPlugin verifies the environment plugin loaded for directory, which
+// names the native location exactly as the adapter addressed it.
 func CheckPlugin(root, directory string) error {
-	canonical, err := filepath.EvalSymlinks(directory)
-	if err != nil {
-		return err
-	}
-
-	hash := sha256.Sum256([]byte(canonical))
+	hash := sha256.Sum256([]byte(directory))
 
 	data, err := os.ReadFile(filepath.Join(root, "ready", hex.EncodeToString(hash[:])))
-	if err != nil || string(data) != canonical {
+	if err != nil || string(data) != directory {
 		return errors.New("native session environment plugin did not load")
 	}
 
 	return nil
+}
+
+// AdvancePluginGeneration makes the environment plugin forget the session
+// environments it applied, so the next tool call in each session reads its
+// carrier again.
+func AdvancePluginGeneration(root string) error {
+	return os.WriteFile(filepath.Join(root, "generation"), []byte(NewID("")), 0o600)
 }

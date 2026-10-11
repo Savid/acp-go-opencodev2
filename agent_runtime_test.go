@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -146,7 +147,7 @@ func TestUnboundDescendantDialogsFailClosed(t *testing.T) {
 				client := opencode.NewClient()
 				client.URL = server.URL
 				rt := &runtime{client: client, bindings: map[string]*binding{"parent": {}}}
-				event := opencode.Event{Type: eventPermissionAsked, Data: json.RawMessage(`{"sessionID":"child","id":"permission"}`)}
+				event := opencode.Event{Type: eventPermissionAsked, SessionID: "child", Data: json.RawMessage(`{"sessionID":"child","id":"permission"}`)}
 				if form {
 					event.Type = eventFormCreated
 					event.Data = json.RawMessage(`{"form":{"sessionID":"child","id":"form"}}`)
@@ -160,4 +161,42 @@ func TestUnboundDescendantDialogsFailClosed(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestDeliverHoldsAFullQueueThenEndsTheBinding(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	bindingCtx, cancel := context.WithCancel(ctx)
+	b := &binding{cancel: cancel, ending: bindingCtx.Done(), events: make(chan opencode.Event, 1)}
+	rt := &runtime{log: slog.New(slog.DiscardHandler), stallLimit: time.Hour}
+	event := opencode.Event{Type: "session.text.delta", SessionID: "ses_full"}
+	rt.deliver(ctx, b, event)
+	delivered := make(chan struct{})
+	go func() {
+		rt.deliver(ctx, b, event)
+		close(delivered)
+	}()
+	select {
+	case <-delivered:
+		t.Fatal("a full queue dropped or skipped an event instead of holding the stream")
+	case <-time.After(20 * time.Millisecond):
+	}
+	<-b.events
+	select {
+	case <-delivered:
+	case <-time.After(testTimeout):
+		t.Fatal("a drained queue did not take the held event")
+	}
+	require.Len(t, b.events, 1)
+	require.NoError(t, b.endCause())
+
+	rt.stallLimit = 10 * time.Millisecond
+	rt.deliver(ctx, b, event)
+	require.ErrorContains(t, b.endCause(), "opencode session event queue stayed full for 10ms")
+	select {
+	case <-b.ending:
+	default:
+		t.Fatal("an overflowing binding was not ended")
+	}
+	rt.deliver(ctx, b, event)
 }

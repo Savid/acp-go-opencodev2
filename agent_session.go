@@ -1,6 +1,7 @@
 package opencodeacp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/savid/acp-go-opencodev2/internal/opencode"
 )
 
 const (
@@ -123,7 +125,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 	case a.deleted[s.id]:
 		refusal = wire.UnknownSession()
 	case a.sessions[s.id] != nil:
-		refusal = wire.InternalFailure(vendor, internalClassNativeStart)
+		refusal = wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	if refusal == nil {
@@ -431,14 +433,14 @@ func (a *Agent) restore(
 	s.id = sessionID
 	s.nativeID = stored.record.NativeSessionID
 	s.rawEvents = wire.NewRawEvents(vendor, string(sessionID), vendor, start.meta.rawEvents)
-	s.title = storedTitle(stored.record.NativeSessionID, stored.rows)
+	s.title = stored.record.Title
 
 	rt, err := s.launch(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rows, err := s.hydrate(ctx, rt, stored)
+	messages, err := s.hydrate(ctx, rt, stored)
 	if err != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
@@ -476,11 +478,11 @@ func (a *Agent) restore(
 		_ = s.close(context.WithoutCancel(ctx))
 		a.detach(ctx, s)
 
-		return nil, nil, a.restoreRefused(ctx, sessionID, err)
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	if replay {
-		if err := s.replay(ctx, rows); err != nil {
+		if err := s.replay(ctx, messages); err != nil {
 			release()
 
 			_ = s.close(context.WithoutCancel(ctx))
@@ -533,28 +535,16 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 	}
 
 	if err := s.commitMirror(ctx, rt, nil); err != nil {
-		return nil, nil, a.restoreRefused(ctx, s.id, err)
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, s.id, err)
 	}
 
 	if replay {
-		var rows [][]byte
-
-		var err error
-
-		if s.ephemeral {
-			rows, err = s.snapshotRows(ctx, rt, nil)
-		} else {
-			var stored storedSession
-
-			stored, err = a.loadStored(ctx, s.id)
-			rows = stored.rows
-		}
-
+		messages, err := a.replayMessages(ctx, s, rt)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if err := s.replay(ctx, rows); err != nil {
+		if err := s.replay(ctx, messages); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -568,6 +558,30 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, rele
 	transferred = true
 
 	return s, release, nil
+}
+
+// replayMessages reads the root history a live session replays: the store's
+// copy, or the native one for an ephemeral session the store never holds.
+func (a *Agent) replayMessages(ctx context.Context, s *session, rt *binding) ([]opencode.Message, error) {
+	if s.ephemeral {
+		graph, err := s.readGraph(ctx, rt, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		return graph[0].Messages, nil
+	}
+
+	stored, err := a.loadStored(ctx, s.id)
+	if err != nil {
+		return nil, err
+	}
+
+	if !stored.found {
+		return nil, wire.RestoreFailed(vendor)
+	}
+
+	return stored.graph[0].Messages, nil
 }
 
 // sameCarrier reports whether a restore names the configuration the live
@@ -676,25 +690,31 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 			continue
 		}
 
-		stored, loadErr := a.loadStored(ctx, id)
+		record, found, loadErr := a.loadRecord(ctx, id)
 		if loadErr != nil {
+			a.log.ErrorContext(ctx, "stored session record unreadable", slog.String("session_id", string(id)), slog.String("reason", loadErr.Error()))
+
 			return acp.ListSessionsResponse{}, wire.InternalFailure(vendor, "")
 		}
 
-		cwd := stored.record.Cwd
+		if !found {
+			continue
+		}
+
+		cwd := record.Cwd
 
 		if filter != "" && cwd != filter {
 			continue
 		}
 
-		title := storedTitle(stored.record.NativeSessionID, stored.rows)
+		title := cmp.Or(record.Title, string(id))
 		updatedAt := time.UnixMilli(summary.UpdatedAtUnixMilli).UTC().Format(time.RFC3339)
 
 		sessions = append(sessions, acp.SessionInfo{
-			Meta:                  wire.NativeSessionMeta(vendor, stored.record.NativeSessionID),
+			Meta:                  wire.NativeSessionMeta(vendor, record.NativeSessionID),
 			SessionId:             id,
 			Cwd:                   cwd,
-			AdditionalDirectories: slices.Clone(stored.record.AdditionalDirectories),
+			AdditionalDirectories: slices.Clone(record.AdditionalDirectories),
 			Title:                 &title,
 			UpdatedAt:             &updatedAt,
 		})

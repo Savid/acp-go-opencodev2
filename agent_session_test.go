@@ -359,7 +359,7 @@ func TestRestoreRefusesPoisonedSession(t *testing.T) {
 				t.Parallel()
 				a, s, cwd := newDirectSession(t)
 				rt := s.binding
-				s.poisonSession(t.Context(), "native_session_identity_drift")
+				s.poisonSession(t.Context(), wire.CauseNativeSessionIdentityDrift)
 				if state == "ended" {
 					rt.cancel()
 					<-rt.done

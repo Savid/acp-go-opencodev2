@@ -15,9 +15,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/savid/acp-go-core/wire"
 )
 
 const MaxBodyBytes = 64 << 20
+
+// EventCapacity bounds the decoded frames waiting for the runtime pump.
 const EventCapacity = 256
 
 // ServerUsername is the basic-auth user the adapter configures the native
@@ -190,12 +194,16 @@ func (c *Client) Export(ctx context.Context, id string) (Export, error) {
 	return out.Data, err
 }
 func (c *Client) Import(ctx context.Context, snapshot Export, location Location) error {
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal(snapshot.Raw, &body); err != nil {
-		return err
+	messages := snapshot.Messages
+	if messages == nil {
+		messages = []Message{}
 	}
 
-	body["location"], _ = json.Marshal(location)
+	body := struct {
+		Info     json.RawMessage `json:"info"`
+		Messages []Message       `json:"messages"`
+		Location Location        `json:"location"`
+	}{snapshot.InfoRaw, messages, location}
 
 	return c.Do(ctx, "", http.MethodPost, "/api/experimental/session/import", body, nil)
 }
@@ -267,9 +275,11 @@ func (c *Client) Subscribe(ctx context.Context) (*Stream, error) {
 	return s, nil
 }
 
+// read decodes each SSE frame once and delivers it in order. A full queue
+// holds the reader, so the native server's stream waits instead of an event
+// being lost.
 func (s *Stream) read(ctx context.Context, reader io.Reader) error {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), MaxBodyBytes)
+	lines := wire.NewLineReader(reader, MaxBodyBytes)
 
 	var data []byte
 
@@ -278,10 +288,8 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 			return nil
 		}
 
-		raw := data
-
-		var event Event
-		if err := json.Unmarshal(raw, &event); err != nil {
+		event, err := DecodeEvent(data)
+		if err != nil {
 			return err
 		}
 
@@ -294,14 +302,24 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			return errors.New("opencode event queue overflow")
 		}
 	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+	for {
+		line, err := lines.Next()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return err
+			}
+
+			if dispatchErr := dispatch(); dispatchErr != nil {
+				return dispatchErr
+			}
+
+			return io.EOF
+		}
+
+		if len(line) == 0 {
 			if err := dispatch(); err != nil {
 				return err
 			}
@@ -311,25 +329,21 @@ func (s *Stream) read(ctx context.Context, reader io.Reader) error {
 			continue
 		}
 
-		if value, ok := strings.CutPrefix(line, "data:"); ok {
-			if len(data) > 0 {
-				data = append(data, '\n')
-			}
+		value, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
 
-			data = append(data, strings.TrimPrefix(value, " ")...)
-			if len(data) > MaxBodyBytes {
-				return errors.New("opencode event exceeds size limit")
-			}
+		value = bytes.TrimPrefix(value, []byte(" "))
+		if data == nil {
+			data = value
+
+			continue
+		}
+
+		data = append(append(data, '\n'), value...)
+		if len(data) > MaxBodyBytes {
+			return errors.New("opencode event exceeds size limit")
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	if err := dispatch(); err != nil {
-		return err
-	}
-
-	return io.EOF
 }
