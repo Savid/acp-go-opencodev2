@@ -195,6 +195,7 @@ func nativeEnvironment(home string) []string {
 }
 func nativeHome(t *testing.T) string {
 	t.Helper()
+
 	return t.TempDir()
 }
 func TestNativeCallbacksPathAndCancellation(t *testing.T) {
@@ -276,6 +277,7 @@ func TestNativeCallbacksPathAndCancellation(t *testing.T) {
 				return true
 			}
 		}
+
 		return false
 	}
 	require.Eventually(t, func() bool { return started() || len(failed) > 0 }, 45*time.Second, 25*time.Millisecond)
@@ -399,6 +401,7 @@ func storedPendingInputs(t *testing.T, store acpcore.SessionStore, id acp.Sessio
 			result[sessionID] = append(result[sessionID], encoded)
 		}
 	}
+
 	return result
 }
 
@@ -413,6 +416,7 @@ func TestNativePendingPlanInputs(t *testing.T) {
 		t.Cleanup(func() { _ = a.Close() })
 		_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 		require.NoError(t, err)
+
 		return a
 	}
 	a := newAgent()

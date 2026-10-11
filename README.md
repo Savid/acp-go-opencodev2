@@ -99,48 +99,41 @@ later step and native usage record. Agent message and thought chunks carry no
 `messageId`, and the breakdown carries no `responseId`: OpenCode keeps none of
 the gateway's response ids, and its own message and part ids are not response ids.
 
-### Persistence and runtime
+### Session store
 
-`SessionStoreFormat` is `opencode-session-export-v2`. The main subpath holds
-the settled native messages of one conversation and its descendants, one row
-each: `{"sessionId":"...","message":RAW}` with the message's raw native bytes.
-Each session's messages keep native order. The `config` sidecar holds the native session information of the graph, parent
-first, the title, accepted options, captured local image bytes, and deferred
+`WithSessionStore` mirrors the session's settled native messages from
+OpenCode's database under its data home, with every descendant session, under
+the main subpath, one row per message as `{"sessionId":"...","message":RAW}`
+with the message's raw native bytes in native order; the adapter's session record
+is under `config`, format `opencode-session-export-v2`. Commit, restore, and
+recovery follow
+[Sessions and the Session Store](https://github.com/savid/acp-go-core/blob/master/docs/03-sessions-and-store.md).
+The record holds the session id, the native session id, the title, `cwd`,
+additional directories, the session environment and ordered path directories,
+the model, mode, effort, and permission, the native information of every graph
+session parent first, captured local image bytes or refusals, and deferred
 synthetic inbox entries.
 
-A commit streams each session's export once and keeps only the messages past
-those the store holds, which it reads only to confirm their bytes are
-unchanged. The root ends at
-the execution's durable idle marker, named by its terminal event; each
-descendant ends at its latest idle marker, and its later messages follow in a
-later commit. The commit appends only the new rows and rewrites the
-configuration only when it changed. A message that settles before mirrored ones,
-a mirrored message whose bytes changed, or a mirrored session leaving the graph
-republishes the generation. Restore
-continues the stored generation without rewriting it. It is durable before terminal idle and
-the prompt response, including on cancellation. Native cumulative usage and
-session timestamps retain their values at capture time and may include later
-execution. Commands without execution, configuration changes, restore, and close
-require the graph to be idle with no pending form or permission. Synthetic
-reminders are restored with their native IDs without starting execution. A
-directory change returns backpressure while native inbox entries remain pending.
+A turn commits the root up to its execution's durable idle marker and each
+descendant up to its latest idle marker; later messages follow in a later
+commit. A history that changed or shrank below the stored rows, or a stored
+session leaving the graph, is republished whole. Restore imports missing
+sessions through the native import API, which cannot replace an existing
+session: existing native messages must keep every saved message's identity,
+content, and order, and may add newly completed assistant, shell, and compaction
+records between them. Synthetic reminders are restored with their native IDs
+without starting execution, and local image replay survives the original file's
+removal. A directory change returns backpressure while native inbox entries
+remain pending.
 
-Load imports missing sessions through the native import API and replays ACP
-history. Resume imports without replay. Existing native messages must preserve
-every saved message’s identity, content, and order. Newly completed assistant,
-shell, and compaction records omitted by earlier native exports may appear
-between saved messages; later turns are adopted. Conflicting or shorter native
-histories are refused because the import API cannot replace a session. Local
-image replay remains available after its original file is removed. The default
-store is in memory; supply a durable store to restore across adapter restarts.
+### Runtime
 
 Native events reach each session in order. Events for a session that falls
 behind wait in its own backlog while other sessions continue. A session whose
 queue takes no event for 15 seconds while it is not settling a turn, or whose
-backlog of raw events passes 4 MiB, ends its
-binding: its native execution is interrupted and its turn fails naming that
-cause. A native
-protocol fault that ends a binding is logged and reported the same way.
+backlog of raw events passes 4 MiB, ends its binding: its native execution is
+interrupted and its turn fails naming that cause. A native protocol fault that
+ends a binding is logged and reported the same way.
 
 Close releases one session while peers retain the shared server. A server crash
 fails affected work, and the next operation starts a replacement and rebinds the
