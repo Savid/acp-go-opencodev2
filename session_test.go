@@ -3,6 +3,7 @@ package opencodeacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -669,11 +670,7 @@ func finishOpeningResponse(t *testing.T, transport *wire.Transport, id acp.Sessi
 
 func TestDeferredOpeningFailureDetachesSession(t *testing.T) {
 	t.Parallel()
-	for _, ephemeral := range []bool{false, true} {
-		name := "stored"
-		if ephemeral {
-			name = "ephemeral"
-		}
+	for _, name := range []string{"stored", "ephemeral", "ended binding"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			a := NewAgent(testOptions(t, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))...)
@@ -686,7 +683,7 @@ func TestDeferredOpeningFailureDetachesSession(t *testing.T) {
 			a.attach(&firstOpenFailureClient{recorder: newRecorder()}, transport)
 			newRequest := wire.NewSessionRequest(t.TempDir())
 			newRequest.Meta = meta
-			if ephemeral {
+			if name == "ephemeral" {
 				newRequest.Meta = wire.SessionMeta{Ephemeral: true}.Apply(meta)
 			}
 			created, err := a.NewSession(t.Context(), newRequest)
@@ -695,6 +692,15 @@ func TestDeferredOpeningFailureDetachesSession(t *testing.T) {
 			s := a.sessions[created.SessionId]
 			a.mu.Unlock()
 			require.NotNil(t, s)
+			if name == "ended binding" {
+				// The binding ends before the opening publishes, so the
+				// opening fails with no binding left to compare.
+				s.mu.Lock()
+				b := s.binding
+				s.mu.Unlock()
+				b.end(errors.New("binding ended before opening"))
+				<-b.done
+			}
 			finishOpeningResponse(t, transport, created.SessionId)
 			require.False(t, s.lc.Active())
 			a.mu.Lock()

@@ -165,8 +165,12 @@ func (a *Agent) scheduleOpen(ctx context.Context, s *session) error {
 				return
 			}
 
+			// The opening failed unless a recovery since then opened a stream of
+			// its own; an ended binding still leaves this establishment owed.
+			opened := s.lc.Active()
+
 			s.mu.Lock()
-			current := !s.closing && s.binding == b
+			current := !s.closing && (s.binding == b || !opened)
 			s.mu.Unlock()
 
 			if current {
