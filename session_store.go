@@ -130,8 +130,17 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 	}
 
 	ctx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
-	source := s.mirrorSource(ctx, rt, terminal)
-	record := func(sessionlog.Tail) (any, error) { return s.record(), nil }
+
+	var last graphTail
+
+	source := s.mirrorSource(ctx, rt, terminal, &last)
+	record := func(sessionlog.Tail) (any, error) {
+		value := s.record()
+		value.Sessions = last.infos
+		value.PendingInputs = last.inputs
+
+		return value, nil
+	}
 
 	err := s.mirror.Commit(ctx, source, record)
 	if errors.Is(err, errRepublish) {
@@ -144,6 +153,8 @@ func (s *session) commitMirror(ctx context.Context, rt *binding, terminal *openc
 	if err == nil {
 		s.mu.Lock()
 		s.persisted = true
+		s.pendingInputs = last.inputs
+		s.nativeInfos = last.infos
 		s.mu.Unlock()
 	}
 

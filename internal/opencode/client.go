@@ -225,7 +225,7 @@ func (c *Client) StreamExport(ctx context.Context, id string, info func(json.Raw
 	decoder := jsontext.NewDecoder(response.Body)
 
 	return readObject(decoder, func(key string) error {
-		if key != "data" {
+		if key != fieldData {
 			return decoder.SkipValue()
 		}
 

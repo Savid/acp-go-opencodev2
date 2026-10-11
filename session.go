@@ -91,6 +91,17 @@ type binding struct {
 	backlog      []opencode.Event
 	backlogBytes int
 	forwarding   bool
+	// overflowed marks a binding that outran its backlog; it takes no more
+	// events.
+	overflowed bool
+}
+
+// dropBacklog marks b overflowed and releases its backlog. The caller holds
+// backlogMu.
+func (b *binding) dropBacklog() {
+	b.overflowed = true
+	b.forwarding = false
+	b.backlog, b.backlogBytes = nil, 0
 }
 
 // end records why the binding ended, keeping the first cause, and ends it.

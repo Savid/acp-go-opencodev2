@@ -31,9 +31,10 @@ const serverHealthTimeout = 2 * time.Second
 // before that binding ends.
 const bindingStallLimit = 15 * time.Second
 
-// maxBacklogBytes bounds the events buffered for one binding whose queue is
-// full.
-const maxBacklogBytes = 16 << 20
+// maxBacklogBytes bounds the raw frames buffered for one binding whose queue
+// is full; each event's data is a slice of its frame. The binding's queue
+// holds at most its capacity of further events.
+const maxBacklogBytes = 4 << 20
 
 // runtime owns one shared server, SSE stream, and native home lock.
 type runtime struct {
@@ -328,10 +329,20 @@ func (rt *runtime) pump(ctx context.Context) {
 // deliver hands one event to its binding in stream order without holding
 // the shared pump: when the binding's queue is full the event joins the
 // binding's backlog, which its forwarder drains. A backlog past its byte bound
-// ends the binding.
+// ends the binding. A binding that has ended or overflowed takes no event.
 func (rt *runtime) deliver(ctx context.Context, b *binding, event opencode.Event) {
 	b.backlogMu.Lock()
 	defer b.backlogMu.Unlock()
+
+	if b.overflowed {
+		return
+	}
+
+	select {
+	case <-b.ending:
+		return
+	default:
+	}
 
 	if !b.forwarding {
 		select {
@@ -342,7 +353,7 @@ func (rt *runtime) deliver(ctx context.Context, b *binding, event opencode.Event
 	}
 
 	if b.backlogBytes+len(event.Raw) > maxBacklogBytes {
-		b.backlog, b.backlogBytes = nil, 0
+		b.dropBacklog()
 
 		rt.workers.Go(func() {
 			rt.overflow(ctx, b, event.SessionID, fmt.Errorf("opencode session event backlog exceeded %d bytes", maxBacklogBytes))
@@ -374,10 +385,16 @@ func (rt *runtime) forward(ctx context.Context, b *binding, sessionID string) {
 
 	for {
 		b.backlogMu.Lock()
+		if b.overflowed {
+			b.backlogMu.Unlock()
+
+			return
+		}
+
 		if len(b.backlog) == 0 {
 			b.forwarding = false
 			b.backlogMu.Unlock()
-			rt.log.InfoContext(ctx, "opencode session event queue drained",
+			rt.log.InfoContext(ctx, "opencode session event backlog drained",
 				slog.String("native_session_id", sessionID), slog.Duration("held", time.Since(started)))
 
 			return
@@ -393,15 +410,27 @@ func (rt *runtime) forward(ctx context.Context, b *binding, sessionID string) {
 
 		select {
 		case b.events <- event:
+			continue
 		case <-b.ending:
-			return
 		case <-ctx.Done():
-			return
 		case <-timer.C:
-			rt.overflow(ctx, b, sessionID, fmt.Errorf("opencode session event queue stayed full for %s", rt.stallLimit))
+			b.backlogMu.Lock()
+			first := !b.overflowed
+			b.dropBacklog()
+			b.backlogMu.Unlock()
+
+			if first {
+				rt.overflow(ctx, b, sessionID, fmt.Errorf("opencode session event queue stayed full for %s", rt.stallLimit))
+			}
 
 			return
 		}
+
+		b.backlogMu.Lock()
+		b.dropBacklog()
+		b.backlogMu.Unlock()
+
+		return
 	}
 }
 
@@ -411,10 +440,6 @@ func (rt *runtime) overflow(ctx context.Context, b *binding, sessionID string, c
 	rt.log.ErrorContext(ctx, "opencode session event queue overflow; ending the session binding",
 		slog.String("native_session_id", sessionID), slog.String("reason", cause.Error()))
 	b.end(cause)
-
-	b.backlogMu.Lock()
-	b.backlog, b.backlogBytes = nil, 0
-	b.backlogMu.Unlock()
 
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 	defer cancel()

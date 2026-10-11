@@ -217,6 +217,25 @@ func TestDeliverBuffersAFullQueueThenEndsTheBinding(t *testing.T) {
 	default:
 		t.Fatal("an overflowing binding was not ended")
 	}
+	for _, id := range []string{"evt_6", "evt_7", "evt_8"} {
+		rt.deliver(ctx, b, event(id))
+	}
+	rt.workers.Wait()
+	b.backlogMu.Lock()
+	require.Empty(t, b.backlog, "an overflowed binding takes no more events")
+	require.False(t, b.forwarding)
+	require.True(t, b.overflowed)
+	b.backlogMu.Unlock()
+	require.EqualValues(t, 1, interrupts.Load(), "an overflow interrupts once")
+
+	closed := newBinding()
+	closed.cancel()
+	closed.events <- event("evt_1")
+	rt.deliver(ctx, closed, event("evt_2"))
+	rt.workers.Wait()
+	closed.backlogMu.Lock()
+	require.Empty(t, closed.backlog, "an ended binding drops events without buffering them")
+	closed.backlogMu.Unlock()
 
 	large := newBinding()
 	rt.deliver(ctx, large, event("evt_1"))

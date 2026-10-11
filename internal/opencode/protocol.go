@@ -1,7 +1,13 @@
 //nolint:tagliatelle // The native API uses uppercase ID suffixes.
 package opencode
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"io"
+)
 
 type ModelRef struct {
 	ID         string `json:"id"`
@@ -181,11 +187,42 @@ type Event struct {
 	Raw       json.RawMessage `json:"-"`
 }
 
-// DecodeEvent decodes one owned SSE frame, which becomes the event's Raw.
+// fieldData is the native envelope key holding an event or response payload.
+const fieldData = "data"
+
+// DecodeEvent decodes one owned SSE frame, which becomes the event's Raw;
+// Data is the slice of Raw holding the event's data, not a copy.
 func DecodeEvent(frame []byte) (Event, error) {
 	var event Event
-	if err := json.Unmarshal(frame, &event); err != nil {
+
+	decoder := jsontext.NewDecoder(bytes.NewReader(frame))
+
+	err := readObject(decoder, func(key string) error {
+		value, err := decoder.ReadValue()
+		if err != nil {
+			return err
+		}
+
+		switch key {
+		case "id":
+			return json.Unmarshal(value, &event.ID)
+		case "type":
+			return json.Unmarshal(value, &event.Type)
+		case "created":
+			return json.Unmarshal(value, &event.Created)
+		case fieldData:
+			end := int(decoder.InputOffset())
+			event.Data = frame[end-len(value) : end : end]
+		}
+
+		return nil
+	})
+	if err != nil {
 		return Event{}, err
+	}
+
+	if _, err := decoder.ReadToken(); !errors.Is(err, io.EOF) {
+		return Event{}, errors.New("trailing data after native event")
 	}
 
 	var data struct {

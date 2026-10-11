@@ -213,8 +213,9 @@ func BenchmarkTurnCommit(b *testing.B) {
 				body.Store(&encoded)
 			}
 			publish()
+			var last graphTail
 			record := func(sessionlog.Tail) (any, error) { return s.record(), nil }
-			require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil), record))
+			require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil, &last), record))
 			for b.Loop() {
 				b.StopTimer()
 				messages = append(messages, benchMessage(len(messages), text), benchMessage(len(messages)+1, text))
@@ -223,7 +224,7 @@ func BenchmarkTurnCommit(b *testing.B) {
 					s.mirror.Reset()
 				}
 				b.StartTimer()
-				require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil), record))
+				require.NoError(b, s.mirror.Commit(b.Context(), s.mirrorSource(b.Context(), rt, nil, &last), record))
 			}
 		})
 	}

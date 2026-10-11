@@ -803,3 +803,33 @@ func TestMirrorRepublishesALateSettledMessage(t *testing.T) {
 	messages := storedMessages(t, rows, record, s.nativeID)
 	require.Equal(t, late.ID, messages[len(messages)-2].ID, "the republished history keeps native order")
 }
+
+func TestFailedCommitKeepsTheSessionsNativeState(t *testing.T) {
+	t.Parallel()
+	store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	a := NewAgent(testOptions(t, WithSessionStore(store))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	sentinel := []json.RawMessage{json.RawMessage(`{"id":"sentinel"}`)}
+	s.mu.Lock()
+	s.nativeInfos = sentinel
+	s.title = "changed"
+	s.mu.Unlock()
+	store.fail.Store(true)
+	require.Error(t, s.commitMirror(t.Context(), s.binding, nil))
+	s.mu.Lock()
+	require.Equal(t, sentinel, s.nativeInfos, "a failed commit leaves the session's native state")
+	s.mu.Unlock()
+	store.fail.Store(false)
+	require.NoError(t, s.commitMirror(t.Context(), s.binding, nil))
+	s.mu.Lock()
+	require.NotEqual(t, sentinel, s.nativeInfos)
+	s.mu.Unlock()
+	record := storedRecord(t, store, created.SessionId)
+	require.Len(t, record.Sessions, 1)
+}

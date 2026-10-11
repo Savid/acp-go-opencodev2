@@ -54,13 +54,15 @@ func graphMark(graph []opencode.Export) mirrorMark {
 	return mark
 }
 
-// mirrorSource reads the native graph for one commit. Continuing from a mark,
+// mirrorSource reads the native graph for one commit, leaving its latest read
+// in last; the mirror may run it more than once, so the session takes the
+// read's state only after the commit succeeds. Continuing from a mark,
 // it streams each session's export and keeps only the messages past what the
 // store holds, so a held message's bytes are never retained; from the zero
 // cursor it returns the whole graph. With a terminal event the root ends at
 // that execution's idle marker and each descendant at its latest one; without
 // one the whole graph must be idle around the read.
-func (s *session) mirrorSource(ctx context.Context, rt *binding, terminal *opencode.Event) sessionlog.Source {
+func (s *session) mirrorSource(ctx context.Context, rt *binding, terminal *opencode.Event, last *graphTail) sessionlog.Source {
 	return func(from sessionlog.Cursor) (sessionlog.Tail, error) {
 		mark, continues := from.Position().(mirrorMark)
 
@@ -87,11 +89,7 @@ func (s *session) mirrorSource(ctx context.Context, rt *binding, terminal *openc
 		}
 
 		s.captureImages(tail.root)
-
-		s.mu.Lock()
-		s.pendingInputs = tail.inputs
-		s.nativeInfos = tail.infos
-		s.mu.Unlock()
+		*last = tail
 
 		return sessionlog.Tail{Rows: tail.rows, Next: sessionlog.Position(tail.mark), Full: !continues}, nil
 	}
